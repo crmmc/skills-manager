@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.40.4] - 2026-10-08
+
+### Release Overview
+- The Git tab becomes persistent custom sources: add a GitHub repo once and browse its skills anytime, with an install-state filter and batch remove.
+
+### User-facing
+- **Custom skill sources are persistent** — GitHub repositories you add are remembered across restarts. Each source expands to list its skills with descriptions, per-skill "installed" badges, and names you can edit before installing.
+- **Expanding a known source is instant and works offline** — Scans are served from a warm local cache; refresh is manual, asks the network, and a failed refresh keeps the list you were looking at instead of blanking it. Source cards show when their content was last fetched, and Settings gained a way to clear the repository cache.
+- **More Git URLs work** — `owner/repo.git` and `ssh://` forms normalize correctly when adding a source.
+- **Filter a source's skills by install state** — All / Installed / Not installed. Filtering only changes what is shown — checkbox state survives switching — and select-all applies to the visible rows only.
+- **Remove installed skills straight from a source** — Check installed rows and "Remove Selected" uninstalls them from every agent and deletes the central-library copy, confirmed by a dialog that lists the names. Rows update in place afterwards; no detour to My Skills, no full rescan.
+
+### Developer & Governance
+- Git previews now carry `installed_skill_id` alongside `installed` (matched by resolved clone URL + subpath, the same pair `confirm_git_install` records), so the UI deletes exactly the skill a row refers to; `is_preview_item_installed` became `find_installed_preview_skill_id` returning the matched record.
+- The source-list toolbar moved into `SourceScanToolbar.tsx` (filter predicate + select-all + install/remove actions); the scan-row rendering in `InstallSkills.tsx` is otherwise unchanged, and filtered rows keep their original indices so index-addressed edit handlers stay correct.
+
 ## [1.40.3] - 2026-10-02
 
 ### Release Overview
