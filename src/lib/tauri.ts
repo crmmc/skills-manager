@@ -15,6 +15,7 @@ export interface ToolInfo {
   project_relative_skills_dir: string | null;
   has_project_path_override: boolean;
   category: ToolCategory;
+  icon: string | null;
 }
 
 export interface ManagedSkill {
@@ -57,6 +58,7 @@ export interface SkillToolToggle {
   installed: boolean;
   globally_enabled: boolean;
   enabled: boolean;
+  deployed: boolean;
 }
 
 export interface SkillDocument {
@@ -74,12 +76,28 @@ export interface SourceSkillDocument {
   revision: string;
 }
 
+/** A file in a skill's central copy (same scope as the content hash and the diff). */
+export interface SkillFile {
+  relative_path: string;
+  size: number;
+  executable: boolean;
+}
+
+export interface SkillFileContent {
+  relative_path: string;
+  content_kind: "text" | "binary" | "too_large";
+  /** Present only when `content_kind === "text"`. */
+  text: string | null;
+}
+
 export type SkillSourceDiffStatus = "added" | "removed" | "modified";
 export type SkillSourceDiffContentKind =
   | "text"
   | "binary"
   | "too_large"
-  | "permission_only";
+  | "permission_only"
+  /** Text past the preview's total budget, listed without its content. */
+  | "omitted";
 
 export interface SkillSourceDiffEntry {
   relative_path: string;
@@ -96,6 +114,8 @@ export interface SkillSourceDiff {
   source_label: string;
   revision: string;
   entries: SkillSourceDiffEntry[];
+  /** More files differ than `entries` lists; the scan stopped at its limit. */
+  truncated: boolean;
 }
 
 export interface Preset {
@@ -221,13 +241,18 @@ export const addCustomTool = (
   displayName: string,
   skillsDir: string,
   projectRelativeSkillsDir?: string,
+  icon?: string | null,
 ) =>
   invoke<void>("add_custom_tool", {
     key,
     displayName,
     skillsDir,
     projectRelativeSkillsDir: projectRelativeSkillsDir ?? null,
+    icon: icon ?? null,
   });
+
+export const setCustomToolIcon = (key: string, icon: string | null) =>
+  invoke<void>("set_custom_tool_icon", { key, icon });
 
 export const removeCustomTool = (key: string) =>
   invoke<void>("remove_custom_tool", { key });
@@ -251,6 +276,15 @@ export const getSourceSkillDocument = (skillId: string) =>
 export const getSkillSourceDiff = (skillId: string) =>
   invoke<SkillSourceDiff>("get_skill_source_diff", { skillId });
 
+export const listSkillFiles = (skillId: string) =>
+  invoke<SkillFile[]>("list_skill_files", { skillId });
+
+export const readSkillFile = (skillId: string, relativePath: string) =>
+  invoke<SkillFileContent>("read_skill_file", { skillId, relativePath });
+
+export const revealSkillFolder = (skillId: string) =>
+  invoke<void>("reveal_skill_folder", { skillId });
+
 export const deleteManagedSkill = (skillId: string) =>
   invoke<void>("delete_managed_skill", { skillId });
 
@@ -259,11 +293,16 @@ export interface BatchDeleteSkillsResult {
   failed: string[];
 }
 
+export interface InstallLocalResult {
+  skill_id: string;
+  name: string;
+}
+
 export const deleteManagedSkills = (skillIds: string[]) =>
   invoke<BatchDeleteSkillsResult>("delete_managed_skills", { skillIds });
 
 export const installLocal = (sourcePath: string, name?: string) =>
-  invoke<void>("install_local", { sourcePath, name: name || null });
+  invoke<InstallLocalResult>("install_local", { sourcePath, name: name || null });
 
 export const installGit = (repoUrl: string, name?: string) =>
   invoke<void>("install_git", { repoUrl, name: name || null });
@@ -273,6 +312,14 @@ export interface GitSkillPreview {
   rel_path: string;
   name: string;
   description: string | null;
+  /**
+   * True when an installed skill already records this repository URL and
+   * subpath. Informational only — the UI pre-deselects such rows; manually
+   * re-checking one means update/reinstall.
+   */
+  installed: boolean;
+  /** Id of the installed skill behind `installed`; null when not installed. */
+  installed_skill_id: string | null;
 }
 
 export interface GitPreviewResult {
@@ -285,14 +332,54 @@ export interface SkillInstallItem {
   name: string;
 }
 
-export const previewGitInstall = (repoUrl: string) =>
-  invoke<GitPreviewResult>("preview_git_install", { repoUrl });
+/**
+ * Preview a repository's skills without installing.
+ *
+ * `refresh` picks the backend cache policy: false (default) serves a warm
+ * repository cache fully offline — expanding a previously scanned source is
+ * instant; true forces a network fetch so the preview reflects the remote's
+ * current state (add-source, error retry, "refresh all").
+ */
+export const previewGitInstall = (repoUrl: string, refresh?: boolean) =>
+  invoke<GitPreviewResult>("preview_git_install", { repoUrl, refresh: refresh ?? false });
 
 export const confirmGitInstall = (repoUrl: string, tempDir: string, items: SkillInstallItem[]) =>
   invoke<void>("confirm_git_install", { repoUrl, tempDir, items });
 
 export const cancelGitPreview = (tempDir: string) =>
   invoke<void>("cancel_git_preview", { tempDir });
+
+// ── Custom Skill Repos (persistent install sources) ──
+
+export interface CustomRepo {
+  id: string;
+  /** Normalized https clone URL — dedupe, scan and install all use it. */
+  url: string;
+  /** Derived "owner/repo" label. */
+  label: string;
+  /** Unix milliseconds. */
+  added_at: number;
+  /**
+   * Unix ms of the last successful network fetch (refresh scan). Null when
+   * never fetched — including records stored before the fields existed.
+   */
+  last_fetch_at: number | null;
+  /** Skill count that fetch saw; same lifecycle as `last_fetch_at`. */
+  last_fetch_count: number | null;
+}
+
+export const listCustomRepos = () =>
+  invoke<CustomRepo[]>("list_custom_repos");
+
+export const addCustomRepo = (url: string) =>
+  invoke<CustomRepo>("add_custom_repo", { url });
+
+export const removeCustomRepo = (id: string) =>
+  invoke<void>("remove_custom_repo", { id });
+
+/** Escape hatch for a corrupted sources list: overwrite it with an empty one. */
+export const resetCustomRepos = () =>
+  invoke<void>("reset_custom_repos");
 
 export const installFromSkillssh = (source: string, skillId: string) =>
   invoke<void>("install_from_skillssh", { source, skillId });
@@ -468,6 +555,32 @@ export const hideToTray = () => invoke<void>("hide_to_tray");
 
 export const openCentralRepoFolder = () =>
   invoke<void>("open_central_repo_folder");
+
+// ── Repository cache management (Settings) ──
+
+export interface RepoCacheStats {
+  total_bytes: number;
+  slot_count: number;
+}
+
+/**
+ * Size and slot count of the persistent git repository cache. Walks the whole
+ * cache server-side (~a second over a large cache), so load on demand rather
+ * than at startup.
+ */
+export const getRepoCacheStats = () =>
+  invoke<RepoCacheStats>("get_repo_cache_stats");
+
+export interface ClearRepoCacheResult {
+  /** Bytes actually deleted. */
+  freed_bytes: number;
+  /** Slots kept because an install held their lock; retry later to finish. */
+  remaining_slots: number;
+}
+
+/** Best-effort deletion of every cached repository checkout. */
+export const clearRepoCache = () =>
+  invoke<ClearRepoCacheResult>("clear_repo_cache");
 
 export interface AppUpdateInfo {
   has_update: boolean;
@@ -702,11 +815,23 @@ export const gitBackupResolveConflict = (
   action: ResolveConflictAction,
 ) => invoke<string>("git_backup_resolve_conflict", { skillId, action });
 
-export const gitBackupClone = (url: string) =>
-  invoke<void>("git_backup_clone", { url });
+/** Local skills that differ from the remote's same-named copies stop the
+ *  clone (`CLONE_LOCAL_DIFFERS`) unless `setAside` is exactly that list, as
+ *  the user confirmed it: their local versions are then saved to a folder
+ *  beside the library, which this resolves to (otherwise `null`). */
+export const gitBackupClone = (url: string, setAside: string[] = []) =>
+  invoke<string | null>("git_backup_clone", { url, setAside });
 
-export const gitBackupReclone = (url: string) =>
-  invoke<void>("git_backup_reclone", { url });
+/** What a re-clone left beside the library: the previous `.git` when its
+ *  history could not be proven to be on the remote, and the set-aside local
+ *  versions (see `gitBackupClone`). */
+export interface RecloneResult {
+  kept_git: string | null;
+  local_copies: string | null;
+}
+
+export const gitBackupReclone = (url: string, setAside: string[] = []) =>
+  invoke<RecloneResult>("git_backup_reclone", { url, setAside });
 
 export const gitBackupCreateSnapshot = () =>
   invoke<string>("git_backup_create_snapshot");
@@ -791,6 +916,10 @@ export const addLinkedWorkspace = (name: string, path: string, disabledPath?: st
 
 export const removeProject = (id: string) =>
   invoke<void>("remove_project", { id });
+
+/** Shows a workspace's folder in the OS file manager, selecting the folder. */
+export const revealProjectFolder = (projectId: string) =>
+  invoke<void>("reveal_project_folder", { projectId });
 
 export const scanProjects = (root: string) =>
   invoke<string[]>("scan_projects", { root });

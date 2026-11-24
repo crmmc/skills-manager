@@ -5,6 +5,196 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.45.0] - 2026-11-14
+
+### 发布概览
+- 更新后，应用会告诉你这一版改了什么。
+
+### 用户可见更新
+- **更新后查看更新内容** — 更新后第一次打开应用，会弹出「更新内容」，列出这一版与你有关的变化。如果中间跳过了几个版本，会把每一版都列出来，最多 5 版。每次更新只弹一次；之后想再看，可以在设置页版本号旁点「更新内容」。内容随应用一起打包，不联网也能看（#669）。
+
+### 开发者与治理更新
+- 弹窗读取构建时打包的 `CHANGELOG.md` / `CHANGELOG-zh.md`，只显示「发布概览」和「用户可见更新」两段；两个文件各自是独立的 chunk，按需加载。上次看过的版本存在 `whats_new_seen_version` 设置里，只留在本机，不随备份同步（#669）。
+- 新增前端测试：中英两份 CHANGELOG 的版本列表不一致，或最近 10 个版本里出现三个标准标题之外的段落标题时会失败。模板没填的版本不会弹窗（#669）。
+## [1.44.0] - 2026-11-12
+
+### 发布概览
+- Agent 现在可以通过 CLI 管理项目级 Skill；Skill 详情页显示实际部署状态，而不是 Preset 的意向；渲染出错时不再整窗空白。
+
+### 用户可见更新
+- **用 CLI 管理项目里的 Skill** — `skills-manager-cli` 新增 `projects` 命令组：`list`、`show`、`add`、`remove`、`deploy`、`undeploy`、`import`。在某个仓库里干活的 Agent 现在可以登记这个项目，把库里的 Skill 或整个 Preset 部署进去，也可以把在项目里写的 Skill 收进库。所有会改动东西的命令都带 `--dry-run`。随应用发布的 `manage-skills` 已补上这些命令的用法。感谢 @vtxyer 和 @haringuyendev，这项功能建立在他们的 PR 之上（#660、#309、#486）。
+- **Skill 详情页显示实际部署状态** — 详情页里各 Agent 的勾和「已同步 x / y」原来跟的是 Preset 里每个 Agent 的开关，而这个开关默认是开的。所以刚加进 Preset 的 Skill 会显示全部已同步，磁盘上却什么都没有。现在绿勾表示已启用且已部署；在生效中的 Preset 上，已启用但还没部署的 Agent 显示「待同步」，点一下就部署。感谢 @akushonkamen（#662、#548、#384）。
+- **共用同一个 skills 目录的 Agent 都能部署** — 有些 Agent 读的是同一个目录，比如 Codex、GitHub Copilot 和 Pi 都读 `~/.agents/skills`。同步模式为「复制」时，从卡片、详情页或 Preset 给其中第二个 Agent 部署会被拒绝；往生效中的 Preset 里安装 Skill 时则显示成功，实际没有部署给它。现在目录里已有的副本和库里一致时，第二个 Agent 会直接接管。你改过的副本不会被动，部署照旧被拒绝（#663）。
+- **渲染出错时不再整窗空白** — 以前页面在渲染时出错，整个窗口会变成一片纯色，没有任何出路。现在会显示错误信息，并提供复制、导出日志和重新加载（#659）。
+- **重复添加同一个项目目录会明确拒绝** — 项目按规范化后的路径保存，同一个目录换种写法（末尾多一个斜杠、经过符号链接）不会再登记成两个项目，提示里会指出已有的那个项目（#660）。
+- **项目目录不存在时会提示，不再重建** — 已登记的项目目录不在了，再往里添加、移除或导入 Skill 时会直接说明。以前添加 Skill 会把这个目录重新建出来（#660）。
+- **主题默认跟随系统** — 没有选过主题时，应用现在跟随系统的浅色或深色外观，以前一律是深色。升级后同样生效：系统是浅色的话，界面会变成浅色。自己选过的主题保持不变（#652、#369）。
+
+### 开发者与治理更新
+- 移除项目里的 Skill 副本、把项目 Skill 导入库，这两处检查现在写在 Rust 里，不再只靠前端：不带 `force` 时，只有已同步的副本或指向库内副本的链接才能移除；同一个 Skill 在项目里有多份副本都与库不同时拒绝导入。应用在自己的确认弹窗之后传 `force`，行为不变（#660）。
+- 把项目 Skill 导入库时现在会拿 `RepoLock`，写 sync metadata 和审计，并在锁内解析和判定目标（#660）。
+- 项目部署的一批里，只要有一个目标会覆盖不属于该 Skill 的内容，或两个 Skill 指向同一个目录，就整批拒绝并返回 `TARGET_CONFLICT`。共用项目目录的任何一个 Agent 都可以用 `--agent` 指定，不再只认登记在前的那个（#660）。
+- 批量部署之外，别的 Agent 的 `skill_targets` 记录只允许认领内容与库一致的目录，不能用来覆盖目录。移除时按物理目录查找其他记录，经符号链接的路径别名也能认出。`skills sync --dry-run` 会把同一轮里先写的目标算进去。批量部署不再把同一路径上另一个 Skill 的记录当作许可（#663）。
+- `get_skill_tool_toggles` 为每个 Agent 返回 `deployed`，取自 `skill_targets`；TypeScript 类型里是必填（#662）。
+- 新增直接依赖 `dunce`，用于在 Windows 上得到不带 verbatim 前缀的规范路径。它原本就在 lockfile 里（#660）。
+- CI 的 Linux 任务改为跑 `cargo test`，原来只跑 `cargo check`（#661）。
+## [1.43.4] - 2026-11-10
+
+### 发布概览
+- 三项修复：TRAE CN 的项目 Skill 放进它实际读取的目录；备份卡住时不再无限期挡住检查更新；扫描本地 Skill 时，几个 Agent 共用目录里的 Skill 只出现一次。
+
+### 用户可见更新
+- **TRAE CN 的项目 Skill 放进它读取的目录** — 在项目工作区里，TRAE CN 的 Skill 之前部署到 `<项目>/.trae-cn/skills`，TRAE CN 并不读这个目录；`~/.trae-cn/skills` 只是它的全局目录。现在部署到 `<项目>/.trae/skills`，TRAE CN 和读同一目录的 TRAE IDE 合成一行。旧版本放进 `.trae-cn/skills` 的 Skill 不会被移走：请在项目里重新添加，旧目录可以删除。感谢 @zhirogo（#645、#632、#247）。
+- **备份卡住不再无限期挡住检查更新** — 后台备份时，如果备份远端不再响应（例如 SSH 连接一直没有回应），备份会一直锁着技能库，期间每次检查更新都报「skills repository is busy」。现在连接备份远端的 git 命令超过 300 秒就放弃并报错，检查更新最多等五分钟。你自己的 SSH 配置照常生效。感谢 @Carlo1911（#585）。
+- **扫描本地 Skill 时每个 Skill 只出现一次** — 有些目录被好几个 Agent 共用，例如 Codex、GitHub Copilot、Pi 等都读 `~/.agents/skills`。「扫描本地 Skills 并导入」会为每个 Agent 各列一次这个目录里的 Skill，一个 Skill 能显示六个相同的位置。现在每个目录只列一次，记在最先找到它的 Agent 名下（#646、#641）。
+
+### 开发者与治理更新
+- 备份仓库里的联网 git（fetch、push、pull、ls-remote、clone）改为走可强制结束的等待，期限 300 秒，与克隆超时一致；同时设置 `GIT_TERMINAL_PROMPT=0`、关闭 stdin，并在 HTTP 速度过低时中止。不注入 `GIT_SSH_COMMAND`。自动备份的 fetch 仍在 `RepoLock` 内执行，因为锁外的 fetch 会和替换整个目录的克隆竞争，所以这次改动是给卡住设了上限，而不是消除「busy」报错（#585）。
+- `scanner::push_discovered` 会跳过已经记录过的路径，扫描结果里的 `skills_found` 和发现列表对每个路径只计一次，记在最先找到它的 adapter 名下。后面的 adapter 不再重复计算同一目录的哈希（#646）。
+- `trae_cn` adapter 新增 `project_relative_skills_dir = ".trae/skills"`，之前回落到它的全局目录 `.trae-cn/skills`。不做迁移（#645）。
+## [1.43.3] - 2026-11-03
+
+### 发布概览
+- 部署给 Antigravity 的 Skill 现在会放进它实际读取的目录。检查更新时遇到网络抖动，同一仓库的 Skill 不再全部显示有更新。项目里几个 Agent 共用的目录，只装了其中一部分 Agent 时也能正常使用。
+
+### 用户可见更新
+- **Antigravity 能找到部署的 Skill 了** — 之前 Antigravity 的 Skill 部署到 `~/.gemini/antigravity/skills`，新版 Antigravity 不读这个目录。现在全局 Skill 部署到 `~/.gemini/config/skills`（Antigravity 的 App、IDE 和 CLI 都读这里），项目 Skill 部署到 `<项目>/.agents/skills`。已部署给 Antigravity 的 Skill 会在下次同步时重新部署到新目录。旧目录里的链接会被删除，副本移到技能库的 `kept-copies/antigravity/` 下，和其他 Agent 目录变更时的处理一样。感谢 @ZhuYichuan（#605），也感谢更早在 #458 提出相同路径的 @zhirogo（#602、#461、#409、#217）。
+- **比较失败不再显示为有更新** — 对于从仓库里某个子目录安装的 Skill，检查更新时会再发一次请求，比较这个子目录和已安装的版本。这次请求失败时（比如网络连接断开），同一仓库的这类 Skill 会全部显示「Update」，角标、通知和自动更新也都据此行动。现在这些 Skill 会显示检查失败，保留已安装的版本，下次检查时再试。仍然可以在卡片上手动更新。感谢 @HengYangDS（#583、#582）。
+- **共用的项目目录保持可用** — 在项目工作区里，读同一个目录的 Agent 会合成一行，例如 Antigravity、Cline、Warp 和 GitLab Duo 都用 `.agents/skills`。之前这一行只看排在第一位的 Agent 是否已安装、已启用，所以以下几种情况都无法在这一行添加 Skill：没装 Cline 的 Warp 用户；和内置 Agent 共用目录的自定义 Agent；没装 TRAE IDE、又把 TRAE CN 的项目目录改成 `.trae/skills` 的用户。现在只要读这个目录的 Agent 里有一个已安装并启用，这一行就能使用。感谢 @GoodScholar 在 #489 中定位到这个问题（#633、#431、#632）。
+
+### 开发者与治理更新
+- 对于上面第二条里的那类 Skill，`skills-manager-cli skills check --json` 现在报 `error`，比较的报错放在 `last_check_error` 里，之前报的是 `update_available`。从仓库根目录安装的 Skill，以及已经在远端最新提交上的子目录 Skill，行为不变。没有新增状态（#583）。
+- `project_agent_targets_for_record` 现在根据项目目录与这一行相同的所有 adapter 来判断「已安装」「已启用」，而不只看这一行的 key 所属的 adapter。`export_skill_to_project` 按同一状态过滤。这一行仍用第一个 adapter 的 key。回归测试改为读取这个 key、不再写死，因为 #605 改变了排在第一位的 adapter（#633、#634）。
+## [1.43.2] - 2026-11-01
+
+### 发布概览
+- 在较旧的 macOS 上打开 Skill 不再黑屏；启动和 CLI 命令不再每次重读所有 Skill 的文件；Skill 预览会隐藏以 Windows 换行保存的元数据头。
+
+### 用户可见更新
+- **较旧的 macOS 上打开 Skill 不再黑屏** — 在 Safari 16.4 之前的 WebKit 上（例如没升级 Safari 的 macOS Monterey），显示 SKILL.md 时用到了这个引擎不支持的正则特性，整个窗口变黑，只能退出应用。现在这类系统改用普通 Markdown 显示：表格、清单和删除线显示为纯文本（#627、#613）。
+- **大 Skill 不再拖慢启动和 CLI 命令** — 每次启动、每条 `skills-manager-cli` 命令，都会把每个 Skill 的所有文件重读一遍来判断是否改动；一个 13,000 个文件的 Skill 在 Windows 上要约 90 秒。现在只有文件的名称、大小或修改时间变了才重读。更新后第一次启动仍会完整读一遍（#628、#623）。
+- **Skill 预览隐藏 Windows 换行的元数据头** — 用 Windows 换行保存的 SKILL.md，或元数据头一直写到文件末尾时，元数据会显示在预览里；空的元数据头还会把下一行 `---` 之前的说明一起藏掉。感谢 @Jiandong7（#620）。
+
+### 开发者与治理更新
+- 数据库 schema 升到 v9，新增本地缓存表 `skill_content_stamps`，记录每个 Skill 的文件指纹和记录时对应的哈希。只有全部文件读取成功、读取期间没有变化时才写入；Skill 记录里的哈希一变，这份指纹就作废。已接受的边界：大小和修改时间都被保留的改写会被当成没变；macOS 和 Linux 上 inode 的变更时间能兜住，Windows 不能。和以往的 schema 变更一样，升级后的数据库旧版本无法打开（#628）。
+- `SkillMarkdown` 在加载时探测一次是否支持正则后行断言。Vite 7 的构建目标是 safari16，esbuild 会把 remark-gfm 里的后行断言字面量改写成运行时的 `new RegExp`，要到渲染文档时才报错（#627）。
+## [1.43.1] - 2026-10-27
+
+### 发布概览
+- 技能库没变时，你在 Agent 目录里改过的副本不再被日常同步覆盖；CLI 的 `skills check` 现在会检查从本地文件夹安装的 Skill。
+
+### 用户可见更新
+- **技能库没变时，改过的副本不再被覆盖** — 以复制方式部署的 Skill，在 PresetBar 应用 Preset、从「添加 Skills」弹层添加、批量部署、安装后的同步，以及内容没变的更新或重新导入时，都会被重新复制一遍，你在 Agent 目录里做的修改随之丢失。现在只要技能库的内容和部署时一样，这些操作就不动副本，和启动时的同步一致。技能库真的更新时，副本仍会被替换，和以前一样。这样的副本要等下次内容变化，或取消部署后重新部署，才会改成链接（#598）。
+- **`skills-manager-cli skills check` 会检查本地 Skill** — 以前对从本地文件夹安装或导入的 Skill 直接跳过，输出 `skipped: true`。现在和应用一样，拿它和源文件夹比对，报告 `up_to_date`、`update_available` 或 `source_missing`。本地检查每次都实际执行，更新检查的缓存只用于 Git 来源。来自网站的 Skill 仍然跳过（#597、#590）。
+
+### 开发者与治理更新
+- 启动同步用来判断「已部署的副本是否仍是最新」的检查，抽成了一个函数 `recorded_target_is_current`，五个同步入口都调用它。只看调用方 Agent 自己的记录，所以多个 Agent 共用一个技能目录时（amp 与 replit、cline 与 warp），行为和以前一样。副本的位置上放着文件或指向别处的链接时，启动同步现在会报告拒绝写入，而不是静默跳过（#598）。
+- `skills/manage-skills` 补充说明：本地 Skill 的 `check` 比对的是什么，`update_available` 和 `source_missing` 是什么意思（#597）。
+## [1.43.0] - 2026-10-21
+
+### 发布概览
+- 「我的 Skill」可以按来源筛选和分组；新增支持 MiniMax Code 和海外版 WorkBuddy。从全局工作区上传的 Skill 下次启动不再消失；Agent 的技能目录换了位置，改过的副本也不会被删；设置页会当场拒绝下次启动无法迁入的中央仓库目录。
+
+### 用户可见更新
+- **「我的 Skill」按来源筛选和分组** — 来源选择器只显示来自某个来源的 Skill；打开分组后，每个来源归到一个标题下，并显示 Skill 数量。同一个仓库不管是用 SSH、HTTPS、`owner/repo` 还是 skills.sh 添加的，都算一个来源；网站来源的 Skill 按域名分组。多于一个 Skill 的来源默认折叠，搜索时所有分组都会展开。分组时不能拖动排序。感谢 @ZhuYichuan（#589、#530）。
+- **MiniMax Code** 成为内置 Agent：用户级 Skill 部署到 `~/.minimax/skills`，项目级部署到 `<repo>/.minimax/skills`。感谢 @ZhuYichuan（#592）。
+- **WorkBuddy AI（海外版）** — 海外版 WorkBuddy 从 `~/.workbuddy-ai/skills` 读取 Skill，所以部署给 WorkBuddy 的 Skill 在海外版里从来没被加载。现在它是单独的 Agent「WorkBuddy AI」；国内版仍用 `~/.workbuddy/skills`。感谢 @huaqian0226（#588、#587、#468）。
+- **从全局工作区上传的 Skill 会留在技能库里** — 上传后，下次启动应用或 CLI 时，这个 Skill 和它的部署记录可能从技能库里消失，文件却还在磁盘上。现在上传会把技能库需要的信息都存好。已经丢失的记录不会恢复。感谢 @drkraft（#586）。
+- **Agent 的技能目录换了位置，改过的副本不会被删** — 在设置里改了 Agent 的技能目录，或者更新后它的默认路径变了，旧路径下以复制方式部署的 Skill 会连同你在里面的修改一起被删掉。现在这些副本会移到技能库里的 `kept-copies/<agent>/`。旧路径下的链接仍然删除。取消部署、停用 Agent、切换到不含这个 Skill 的 Preset，仍然会删掉副本（#595、#593）。
+- **设置页拒绝无法迁入的中央仓库目录** — 新的技能库位置要到下次启动才生效，而启动时会拒绝非空目录和位于当前技能库内的目录，并且不提示，看起来就像设置没生效（#509、#541）。现在保存时就会拒绝这样的目录，并给出提示，不再显示 `[object Object]`。迁移警告显示在路径下方，提示里也写明要完全退出应用（包括托盘）（#596）。
+- **来源里没有某个 Skill 时，报错更清楚** — 安装一个在取得的仓库版本里不存在的 Skill，报错里显示的是一个临时目录路径。现在报错会写出 Skill 的名字，并提示检查来源和子路径（#594）。
+- **Windows：可以用 Scoop 安装** — 先 `scoop bucket add extras`，再 `scoop install extras/skills-manager`。感谢 @12dxc 把它加入 Scoop Extras（#591）。
+
+### 开发者与治理更新
+- 前端组件测试：Vitest + jsdom，新增 `npm test` 脚本和 PresetBar 的测试，Frontend CI 会运行它们。感谢 @huoguojun123（#570）。
+- 新增 `REVIEW.md`：按改动涉及的内容决定评审深度，并列出本仓库反复出现的缺陷类型。
+- 判断「目标是否在当前技能库内」时会先解析链接，保存路径和启动迁移都是如此。以前经由链接指回技能库的目标能通过检查，启动迁移随后会尝试把技能库复制进它自己（#596）。
+- `sync_skill_to_active_scenario` 和 `sync_desired_targets` 一样，不再动另一个工具正在使用的部署路径（#595）。
+## [1.42.2] - 2026-10-18
+
+### 发布概览
+- 两项 Linux / Windows 修复：Linux AppImage 里的备份和 Git 安装恢复正常；Windows 和 Linux 的窗口顶部不再有一条空白。
+
+### 用户可见更新
+- **Linux AppImage：备份和 Git 安装恢复正常** — 在 AppImage 里，「立即备份」以及从 Git 安装、更新 Skill 可能失败，报 Git HTTPS helper / libcurl 符号查找错误。原因是系统的 `git` 加载了 AppImage 自带的库。现在 Git 使用系统自己的库。感谢 @JonathanPitre（#539、#536）。
+- **Windows 和 Linux：窗口顶部不再有空白条** — 为 macOS 窗口按钮预留的 28px 空白条，在 Windows 和 Linux 上也会出现在原生标题栏下方。现在只在 macOS 上保留。感谢 @YageGeng（#547）。
+
+### 开发者与治理更新
+- `git_fetcher.rs` 和 `git_backup.rs` 里两份相同的 `git_command()` 合并到 `core/git_command.rs`。Linux 上设置了 `APPDIR` 时，Git 子进程不再继承 `LD_LIBRARY_PATH`，应用自身的环境不变。新增的回归测试只在 Linux 上运行，而 Linux CI 只跑 `cargo check`。
+## [1.42.1] - 2026-10-17
+
+### 发布概览
+- 修复几类问题：从 Preset 移除的 Skill 重启后又回来；Preset 的改动不同步到其他设备；monorepo 里的 Skill 总显示有更新；点一下就删掉工作区目录。另外，市场页会显示真实的报错原因，本地安装、Windows 和 Linux 上也各有小修复。
+
+### 用户可见更新
+- **从工作区移除 Skill 前先确认** — 在技能库 Skill 详情的「项目工作区」区块里，点绿色的「已添加」会直接删掉工作区里这个 Skill 的目录。删除不进废纸篓；如果是关联工作区，删掉的就是 Agent 正在读的那个目录。现在点了会先确认。项目页上，关闭某个 Skill 的 Agent 开关或取消某个 Preset 时，如果工作区里的副本与技能库不一致，也会先确认（#542）。
+- **从当前生效的 Preset 移除的 Skill 不再复活** — 移除一个属于当前生效 Preset 的 Skill 后，下次启动它又会被装回来。不论是在 Agent 页、在托盘，还是用 `skills-manager-cli presets undeploy` / `skills undeploy` 移除，都有这个问题。现在会记住这次移除；重新部署则会恢复（#549）。
+- **移除最后一个 Preset 成员也能同步到其他设备** — 把 Preset 里最后一个 Skill 移除后，其他设备上的旧成员不会被删掉，还可能被它们重新备份上去，于是已移除的 Skill 在所有设备上又出现了。现在移除能正常同步（#553）。
+- **monorepo 里的 Skill 不再总显示「有更新」** — 从仓库某个子目录安装的 Skill，过去只要仓库里任何地方有新提交，就会显示「有更新」。现在只有它自己的目录变了才算（#561、#507）。
+- **可以移除部分已添加的 Preset** — 一个 Preset 只有部分 Skill 在工作区里时，旁边会出现 ×，点它即可移除这些 Skill。感谢 @huoguojun123（#571）。
+- **市场页显示真实的报错原因** — 连不上 skills.sh 时，过去只显示 `[object Object]`，现在会显示具体原因，比如超时或 DNS 解析失败（#529）。
+- **上传「仅本地」的 Skill 不再报 infinite recursion** — 当这个 Skill 的目录是指回技能库的软链时，过去会报这个错。感谢 @shuaiyafei（#565、#560）。
+- **Windows：本地安装 Skill** 后，提示里显示的是 Skill 的名称，不再是完整路径。感谢 @shuaiyafei（#558、#512）。
+- **Linux：同时运行其他 Tauri 应用时，托盘图标不再被换成它的图标**。感谢 @jubeater（#564、#563）。
+
+### 开发者与治理更新
+- 设置页改为运行时用 `getVersion()` 读取版本号；语言文件里存的是 `{{version}}` 模板，`release:prepare` 不再改写它们。感谢 @shuaiyafei（#557、#511）。
+- 同步 metadata 中，只要 `schema.json` 和 `scenarios/` 都在，Preset 快照就算完整；缺 `scenario-skills/` 表示零个成员，因为 Git 不保存空目录。
+- 在 Skill 详情面板之外修改的 Preset 按 Agent 开关，现在会在 repo 锁内写回该成员的 metadata 文件。过去只存在数据库里，下次 reindex 会被覆盖。`apply_skills_to_tools` 在添加或移除之前，会先写当前生效 Preset 中相关 Skill 的开关。
+- 子目录 Skill 的更新检查只把 tree 和 commit（`--filter=blob:none --depth=1`）取到一个用完即删的 bare 仓库，用 libgit2 比较该子目录的 tree 以及沿途每一级 `.gitattributes`。任何失败都仍按「有更新」处理。
+- 本地安装时，技能库里的目标是真实目录才直接返回；如果目标是软链，仍会复制成真实目录。
+## [1.42.0] - 2026-10-14
+
+### 发布概览
+- 新增西班牙语和韩语界面，繁体中文翻译补全；搜索时 `-`、`_` 和空格视为相同；macOS 上点击 Dock 图标可唤回窗口；配色、字号与圆角更统一，浅色模式更易读。
+
+### 用户可见更新
+- **西班牙语和韩语界面** — 在「设置 → 语言」里选 Español 或 한국어。首次启动时，如果系统语言是西班牙语或韩语，会自动选中。语言增加到五种，这一项改成了下拉框。感谢 @Carlo1911（#476）和 @siakun（#355）。
+- **繁体中文翻译补全** — 此前仍显示为简体中文的 72 条文案已全部翻译，包括关闭行为、托盘图标、代理设置、来源差异和批量编辑标签等。
+- **搜索时 `-`、`_` 和空格视为相同** — 搜「wrap up」能找到 `wrap-up`，技能库、Agent 工作区、项目页、命令面板和「添加 Skill」都一样；技能库还会搜索 Skill 的目录名。感谢 @shuaiyafei（#543、#510）。
+- **macOS：点击 Dock 图标可唤回窗口** — 窗口关闭到托盘或最小化后，点 Dock 图标会重新显示。感谢 @sean0407（#538、#526）。
+- **浅色模式更易读** — Preset 图标、状态图标，以及部分成功、警告和删除文字，原先用的是给深色背景设计的颜色，在浅色背景上几乎看不清。全应用的字号和圆角也统一到同一套档位（#544、#545、#551）。
+
+### 开发者与治理更新
+- `npm run lint` 新增两项检查。`scripts/check-ui-spec.mjs` 拦截档位之外的圆角和字号、类名里写死的颜色，以及只在一种主题下可读的调色板文字色。`scripts/check-i18n.mjs` 要求 `zh.json` 与 `en.json` 逐键对应；其他语种允许缺键（缺的会回落到英文），但不能保留 `en.json` 已删除的键，占位符也必须一致。
+- `release:prepare` 会更新每个 `src/i18n/*.json` 里的版本号，新增语种不用再改脚本。「Prepare Release」工作流现在会提交脚本改动的全部文件，此前只提交其中五个。
+- 所有技能搜索共用 `src/lib/skillSearch.ts`。
+- `RunEvent::Reopen` 的处理只在 macOS 上生效，Windows 和 Linux 构建不再报参数未使用的警告（#552）。
+## [1.41.0] - 2026-10-11
+
+### 发布概览
+- 网站自己发布的技能（包括飞书官方技能）可以从市场安装了；恢复备份不再丢本地技能；另有 ESC 关闭详情、记住视图与窗口大小、项目页一键打开文件夹。
+
+### 用户可见更新
+- **可以安装网站自己发布的技能** — skills.sh 上有一类技能不在 GitHub，而是托管在厂商自己的网站，比如飞书官方的 `lark-*` 系列。过去安装它们会失败，因为应用会去找一个并不存在的 GitHub 仓库。现在可以从市场、粘贴 `skills.sh/site/…` 链接，或用 `skills-manager-cli skills install` 安装；`skills search` 输出的地址也能直接拿去安装。下载只走 HTTPS，并校验大小、路径和校验码。这类技能是快照，不检查更新，重新安装即可拿到当前版本。感谢 @samuelbushi（#382、#381）。
+- **恢复备份不再丢本地技能** — 把远端备份克隆到已有技能的库里时，若本地技能与远端同名但内容不同，本地那份会被静默替换；重新克隆还会删掉从未推送过的提交。现在同名技能内容不同时，克隆会停下并原样恢复，并提供把本地版本另存到库旁 `skills-local-copies-…` 文件夹后继续的选项。重新克隆时，只有旧历史已全部在远端，才会删掉旧的 `.git`（#531、#532）。
+- **ESC 关闭技能详情**，上面盖着对话框或命令面板时除外。感谢 @GoodScholar（#494、#453）。
+- **记住网格/列表视图**，技能库、Agent 工作区和项目页共用，重启后仍保留；默认仍是网格。感谢 @GoodScholar（#493、#442）。
+- **窗口按上次的位置和大小打开**；若上次所在的显示器已断开，则由系统重新摆放。感谢 @yinfall（#404）。
+- **项目页一键在文件管理器中显示项目文件夹**：点击项目名旁的文件夹图标。感谢 @ZhuYichuan（#473）。
+- **Git 安装支持 `owner/repo.git` 和 `ssh://` 地址** — 之前它们会被改写成不存在的地址（`….git.git`、`github.com/ssh://…`）。感谢 @crmmc（#517、#516）。
+
+### 开发者与治理更新
+- 新增 `core/well_known.rs`，读取网站的 `/.well-known/agent-skills/` 或 `/.well-known/skills/` 索引（v1 文件清单、带校验码的 v2 压缩包）。网站技能以来源类型 `well-known` 记录，并按规范化的 `skills.sh/site/<域名>/<技能>` 地址识别。它与 skills.sh 安装共用的目标目录规则，现在也会拒绝磁盘上已存在但没有记录的文件夹。
+- `core/file_manager.rs` 统一托盘、设置页和导出日志三处打开文件管理器的调用；参数保持 `OsString`，非 UTF-8 路径原样传递（#537）。
+- 引入 `tauri-plugin-window-state`；主窗口启动时先隐藏，恢复保存的状态后再显示。
+- 新增 `frontend.yml` CI：前端源码、配置或 lockfile 变动时运行 lint 和生产构建。
+
+## [1.40.4] - 2026-10-08
+
+### 发布概览
+- Git 标签页升级为持久化的自定义仓库源：GitHub 仓库添加一次随时可看，新增按安装状态过滤和批量移除。
+
+### 用户可见更新
+- **自定义技能源持久保存** — 添加的 GitHub 仓库会跨重启记住。展开即列出其中的技能：带描述、逐个的「已安装」徽标，安装前可修改名称。
+- **展开已知源即时响应且可离线** — 扫描优先读本地温缓存；刷新改为手动、走网络，失败时保留你正在看的列表而不是清空。源卡片显示内容最近一次抓取的时间，设置里可以清理仓库缓存。
+- **更多 Git 地址可用** — 添加源时 `owner/repo.git` 和 `ssh://` 形式能正确归一化。
+- **按安装状态过滤源内技能** — 全部 / 已安装 / 未安装。过滤只影响显示，勾选状态跨切换保留；全选只作用于当前可见行。
+- **在源里直接移除已安装技能** — 勾选已安装行后「移除所选」会从各 Agent 卸载并删除中央库副本，确认框会列出名称。移除后行内就地更新，不用绕去「我的技能」，也不整卡重扫。
+
+### 开发者与治理更新
+- Git 预览在 `installed` 之外带回了 `installed_skill_id`（按解析后的克隆地址 + 子路径匹配，与 `confirm_git_install` 记录的同一对键），界面删除的正是该行对应的技能；`is_preview_item_installed` 更名为 `find_installed_preview_skill_id` 并返回匹配到的记录。
+- 源列表工具栏移入 `SourceScanToolbar.tsx`（过滤谓词 + 全选 + 安装/移除）；`InstallSkills.tsx` 的行渲染保持不变，过滤后的行保留原始下标，按下标定位的编辑逻辑不受影响。
 ## [1.40.3] - 2026-10-02
 
 ### 发布概览

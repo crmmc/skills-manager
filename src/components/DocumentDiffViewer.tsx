@@ -1,5 +1,7 @@
 import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { cn } from "../utils";
+import { diffExceedsBudget } from "../lib/diffBudget";
 
 interface DocumentDiffViewerProps {
   original: string;
@@ -197,7 +199,7 @@ function DiffCell({
         {number ?? ""}
       </td>
       <td
-        className={cn("border-r border-border-subtle px-3 font-mono text-[12.5px] leading-6", tone.codeClass)}
+        className={cn("border-r border-border-subtle px-3 font-mono text-[13px] leading-6", tone.codeClass)}
         style={tone.codeStyle}
       >
         <span className={cn("mr-3 inline-block w-3 select-none text-center font-semibold", tone.markerClass)}>
@@ -210,8 +212,21 @@ function DiffCell({
 }
 
 export function DocumentDiffViewer({ original, updated, className }: DocumentDiffViewerProps) {
-  const rows = useMemo(() => buildDiffRows(original, updated), [original, updated]);
+  const { t } = useTranslation();
+  const tooLarge = useMemo(() => diffExceedsBudget(original, updated), [original, updated]);
+  const rows = useMemo(
+    () => (tooLarge ? [] : buildDiffRows(original, updated)),
+    [tooLarge, original, updated]
+  );
   const hunks = useMemo(() => buildHunks(rows), [rows]);
+
+  if (tooLarge) {
+    return (
+      <div className={cn("px-4 py-4 text-[12px] text-muted", className)}>
+        {t("common.diffTooLarge")}
+      </div>
+    );
+  }
 
   if (hunks.length === 0) {
     return (
