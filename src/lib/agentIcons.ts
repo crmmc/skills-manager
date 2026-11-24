@@ -30,6 +30,7 @@ const AGENT_ICON_FILES: Record<string, string> = {
   kiro: "kiro.svg",
   kode: "kode.png",
   mcpjam: "mcpjam.png",
+  minimax_code: "minimax_code.png",
   mistral_vibe: "mistral_vibe.svg",
   mux: "mux.png",
   neovate: "neovate.png",
@@ -48,6 +49,7 @@ const AGENT_ICON_FILES: Record<string, string> = {
   warp: "warp.svg",
   windsurf: "windsurf.svg",
   workbuddy: "workbuddy.png",
+  workbuddy_overseas: "workbuddy.png",
   zencoder: "zencoder.png",
   zcode: "zcode.svg",
 };
@@ -71,4 +73,9 @@ export function agentIconNeedsDarkInvert(agentKey: string): boolean {
 
 export function hasAgentIcon(agentKey: string): boolean {
   return Boolean(AGENT_ICON_FILES[agentKey]);
+}
+
+/** All icon keys available for a user to pick from (e.g. for a custom agent). */
+export function listAgentIconKeys(): string[] {
+  return Object.keys(AGENT_ICON_FILES).sort((a, b) => a.localeCompare(b));
 }

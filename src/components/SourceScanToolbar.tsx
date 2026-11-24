@@ -96,7 +96,7 @@ export function SourceScanToolbar({
           type="button"
           onClick={onRemoveSelected}
           disabled={busy || removableCount === 0}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[13px] font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-[13px] font-medium text-red-600 dark:text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
         >
           {removing ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />

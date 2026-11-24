@@ -15,6 +15,7 @@ export interface ToolInfo {
   project_relative_skills_dir: string | null;
   has_project_path_override: boolean;
   category: ToolCategory;
+  icon: string | null;
 }
 
 export interface ManagedSkill {
@@ -57,6 +58,7 @@ export interface SkillToolToggle {
   installed: boolean;
   globally_enabled: boolean;
   enabled: boolean;
+  deployed: boolean;
 }
 
 export interface SkillDocument {
@@ -74,12 +76,28 @@ export interface SourceSkillDocument {
   revision: string;
 }
 
+/** A file in a skill's central copy (same scope as the content hash and the diff). */
+export interface SkillFile {
+  relative_path: string;
+  size: number;
+  executable: boolean;
+}
+
+export interface SkillFileContent {
+  relative_path: string;
+  content_kind: "text" | "binary" | "too_large";
+  /** Present only when `content_kind === "text"`. */
+  text: string | null;
+}
+
 export type SkillSourceDiffStatus = "added" | "removed" | "modified";
 export type SkillSourceDiffContentKind =
   | "text"
   | "binary"
   | "too_large"
-  | "permission_only";
+  | "permission_only"
+  /** Text past the preview's total budget, listed without its content. */
+  | "omitted";
 
 export interface SkillSourceDiffEntry {
   relative_path: string;
@@ -96,6 +114,8 @@ export interface SkillSourceDiff {
   source_label: string;
   revision: string;
   entries: SkillSourceDiffEntry[];
+  /** More files differ than `entries` lists; the scan stopped at its limit. */
+  truncated: boolean;
 }
 
 export interface Preset {
@@ -221,13 +241,18 @@ export const addCustomTool = (
   displayName: string,
   skillsDir: string,
   projectRelativeSkillsDir?: string,
+  icon?: string | null,
 ) =>
   invoke<void>("add_custom_tool", {
     key,
     displayName,
     skillsDir,
     projectRelativeSkillsDir: projectRelativeSkillsDir ?? null,
+    icon: icon ?? null,
   });
+
+export const setCustomToolIcon = (key: string, icon: string | null) =>
+  invoke<void>("set_custom_tool_icon", { key, icon });
 
 export const removeCustomTool = (key: string) =>
   invoke<void>("remove_custom_tool", { key });
@@ -251,6 +276,15 @@ export const getSourceSkillDocument = (skillId: string) =>
 export const getSkillSourceDiff = (skillId: string) =>
   invoke<SkillSourceDiff>("get_skill_source_diff", { skillId });
 
+export const listSkillFiles = (skillId: string) =>
+  invoke<SkillFile[]>("list_skill_files", { skillId });
+
+export const readSkillFile = (skillId: string, relativePath: string) =>
+  invoke<SkillFileContent>("read_skill_file", { skillId, relativePath });
+
+export const revealSkillFolder = (skillId: string) =>
+  invoke<void>("reveal_skill_folder", { skillId });
+
 export const deleteManagedSkill = (skillId: string) =>
   invoke<void>("delete_managed_skill", { skillId });
 
@@ -259,11 +293,16 @@ export interface BatchDeleteSkillsResult {
   failed: string[];
 }
 
+export interface InstallLocalResult {
+  skill_id: string;
+  name: string;
+}
+
 export const deleteManagedSkills = (skillIds: string[]) =>
   invoke<BatchDeleteSkillsResult>("delete_managed_skills", { skillIds });
 
 export const installLocal = (sourcePath: string, name?: string) =>
-  invoke<void>("install_local", { sourcePath, name: name || null });
+  invoke<InstallLocalResult>("install_local", { sourcePath, name: name || null });
 
 export const installGit = (repoUrl: string, name?: string) =>
   invoke<void>("install_git", { repoUrl, name: name || null });
@@ -776,11 +815,23 @@ export const gitBackupResolveConflict = (
   action: ResolveConflictAction,
 ) => invoke<string>("git_backup_resolve_conflict", { skillId, action });
 
-export const gitBackupClone = (url: string) =>
-  invoke<void>("git_backup_clone", { url });
+/** Local skills that differ from the remote's same-named copies stop the
+ *  clone (`CLONE_LOCAL_DIFFERS`) unless `setAside` is exactly that list, as
+ *  the user confirmed it: their local versions are then saved to a folder
+ *  beside the library, which this resolves to (otherwise `null`). */
+export const gitBackupClone = (url: string, setAside: string[] = []) =>
+  invoke<string | null>("git_backup_clone", { url, setAside });
 
-export const gitBackupReclone = (url: string) =>
-  invoke<void>("git_backup_reclone", { url });
+/** What a re-clone left beside the library: the previous `.git` when its
+ *  history could not be proven to be on the remote, and the set-aside local
+ *  versions (see `gitBackupClone`). */
+export interface RecloneResult {
+  kept_git: string | null;
+  local_copies: string | null;
+}
+
+export const gitBackupReclone = (url: string, setAside: string[] = []) =>
+  invoke<RecloneResult>("git_backup_reclone", { url, setAside });
 
 export const gitBackupCreateSnapshot = () =>
   invoke<string>("git_backup_create_snapshot");
@@ -865,6 +916,10 @@ export const addLinkedWorkspace = (name: string, path: string, disabledPath?: st
 
 export const removeProject = (id: string) =>
   invoke<void>("remove_project", { id });
+
+/** Shows a workspace's folder in the OS file manager, selecting the folder. */
+export const revealProjectFolder = (projectId: string) =>
+  invoke<void>("reveal_project_folder", { projectId });
 
 export const scanProjects = (root: string) =>
   invoke<string[]>("scan_projects", { root });

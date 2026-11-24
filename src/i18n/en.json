@@ -326,15 +326,14 @@
     "confirmSyncMessage": "Sync \"{{name}}\" to these {{count}} agents.",
     "confirmUnsyncMessage": "Remove \"{{name}}\" from these {{count}} synced agents.",
     "sourceType": "Source type",
-    "sourceRef": "Source",
-    "sourceResolved": "Resolved source",
     "sourceBranch": "Branch / Tag",
     "sourceSubpath": "Subpath",
     "sourceRevision": "Revision",
     "docTabs": {
       "local": "Local",
       "diff": "Diff",
-      "source": "Source"
+      "source": "Source",
+      "files": "Files"
     },
     "sourceDiffUnavailable": "Source content is unavailable right now",
     "sourceDiff": {
@@ -345,23 +344,25 @@
         "modified": "Modified"
       },
       "execBit": "Permission {{before}} → {{after}}",
+      "collapsedHint": "{{count}} files changed. Click a file to see its changes.",
+      "truncated": "Showing the first {{count}} changed files; more files changed. Updating applies every change.",
       "summary": {
         "binary": "Binary file changed",
         "too_large": "File changed but is too large to preview",
-        "permission_only": "Only file permissions changed"
+        "permission_only": "Only file permissions changed",
+        "omitted": "File changed; too many changes to load its content here"
       }
     },
     "localSource": "Local library",
     "agentCount": "{{count}} agents",
     "ready": "Ready",
     "standby": "Standby",
-    "agentTogglesTitle": "Global Workspace",
-    "expandAgentToggles": "Expand",
-    "collapseAgentToggles": "Collapse",
     "agentToggleEnabled": "{{agent}} enabled",
     "agentToggleDisabled": "{{agent}} disabled",
     "agentToggleNotInstalled": "Not installed",
     "agentToggleDisabledGlobally": "Disabled in Settings",
+    "agentTogglePendingSync": "Pending sync",
+    "agentTogglePendingSyncHint": "Enabled in this preset but not deployed to this agent yet. Click to deploy.",
     "agentUnavailableCount": "{{count}} unavailable",
     "updateStatus": {
       "unknown": "Unknown",
@@ -402,7 +403,14 @@
       "local": "Local",
       "import": "Imported",
       "git": "Git",
-      "skillssh": "skills.sh"
+      "skillssh": "skills.sh",
+      "website": "Website"
+    },
+    "groupBySource": "Group by source",
+    "sourcePicker": {
+      "label": "Source",
+      "clear": "Clear source filter",
+      "unknownSource": "Unclassified"
     },
     "tags": {
       "filter": "Tags",
@@ -415,13 +423,18 @@
       "renameTag": "Rename tag",
       "deleteTag": "Delete tag",
       "tagName": "Tag name",
+      "showAll": "Show all {{count}}",
+      "showFewer": "Show fewer",
+      "foldedSelected": "({{count}} selected)",
       "manageHint": "Right-click to rename or delete",
       "tagRenamed": "Tag renamed",
       "tagDeleted": "Tag deleted",
-      "deleteConfirm": "Remove the tag \"{{tag}}\" from all skills?"
+      "deleteConfirm": "Remove the tag \"{{tag}}\" from all skills?",
+      "addTagShort": "Add tag"
     },
     "selectMode": "Select",
     "selectedCount": "{{count}} selected",
+    "notShownCount": "({{count}} not shown)",
     "selectHint": "Click skills to select",
     "batchUpdate": "Update {{count}}",
     "batchUpdated": "{{count}} skills refreshed",
@@ -429,6 +442,7 @@
     "batchUpdateFailed": "{{count}} skills failed to refresh",
     "deleteSelected": "Delete {{count}}",
     "batchDeleteConfirm": "Delete {{count}} selected skills permanently? This removes their central library files, preset links, and synced agent targets.",
+    "batchDeleteConfirmWithHidden": "Delete {{count}} selected skills permanently, including {{hidden}} not shown in the list? This removes their central library files, preset links, and synced agent targets.",
     "batchDeleted": "{{count}} skills deleted",
     "batchDeleteFailed": "{{count}} skills failed to delete",
     "batchToggleFailed": "{{count}} skills failed to update",
@@ -462,6 +476,26 @@
       "apply": "Sync {{count}}",
       "noAgents": "No installed and enabled agents.",
       "allSynced": "Every selected skill is already on this agent"
+    },
+    "detail": {
+      "preset": "Preset",
+      "agents": "Agents",
+      "deployedTo": "Deployed to",
+      "source": "Source",
+      "neverChecked": "Not checked yet",
+      "copyPath": "Copy path",
+      "pathCopied": "Path copied",
+      "revealFolder": "Show in file manager",
+      "filesUnavailable": "The skill's files could not be read",
+      "fileNotFound": "This file is not in the skill",
+      "fileBinary": "Binary file, not shown",
+      "fileTooLarge": "Too large to preview (over 256 KB)",
+      "backToFiles": "Back to files",
+      "noFiles": "This skill has no files",
+      "executable": "exec",
+      "executableHint": "Executable file",
+      "location": "Location",
+      "lastCheckedLabel": "Last checked"
     }
   },
   "install": {
@@ -640,6 +674,9 @@
     "overridePathHint": "Using a manually overridden skills path",
     "customAgentAdded": "Custom agent added",
     "customAgentRemoved": "Custom agent removed",
+    "agentIcon": "Icon",
+    "noIcon": "No icon",
+    "changeAgentIcon": "Change icon",
     "selectFolder": "Select",
     "addAgent": "Add",
     "globalConfig": "Global Configuration",
@@ -647,11 +684,13 @@
     "repoPathDesc": "Default storage location for all Skills and preset configs.",
     "repoPathSaved": "Central repository path updated",
     "repoPathReset": "Central repository path reset to default",
-    "repoPathRestartNotice": "Restart the app to apply the new path and migrate existing data.",
+    "repoPathRestartNotice": "Quit the app completely, including from the tray, then open it again to apply the new path and move existing data.",
     "repoPathEmpty": "Enter a central repository path first",
     "repoPathDefaultHint": "Using the default central repository path",
     "repoPathCustomHint": "Using a custom central repository path",
-    "repoPathPendingHint": "Restart the app to move the library to {{path}}. Until then this session keeps using the current location.",
+    "repoPathPendingHint": "Quit the app completely, including from the tray, and open it again to move the library to {{path}}. Until then this session keeps using the current location.",
+    "repoPathTargetNotEmpty": "{{path}} is not empty. Choose an empty or new folder for the central repository.",
+    "repoPathTargetInsideLibrary": "{{path}} is inside the current library. Choose a folder outside it.",
     "changeDir": "Change Directory",
     "openInFinder": "Open Folder",
     "repoCache": "Repository Cache",
@@ -664,7 +703,7 @@
     "repoCacheCleared": "Freed {{size}}",
     "repoCacheRemaining": "{{count}} repo(s) were in use and kept — clear again later",
     "syncMode": "Default Sync Mode",
-    "syncModeDesc": "Symlinks are recommended — minimal disk usage with live updates. Applies to both global and project workspaces; note that symlinks in a project point to this machine's central library and won't travel with the repo.",
+    "syncModeDesc": "Symlinks are recommended — minimal disk usage with live updates. Applies to both global and project workspaces; note that symlinks in a project point to this machine's central library and won't travel with the repo. Exception: Antigravity gets copies on Windows, and a project's .agents/skills folder gets copies while Antigravity is installed and enabled, because Antigravity does not load links there.",
     "symlink": "Symlink",
     "copy": "File Copy",
     "currentPreset": "Current Preset",
@@ -682,9 +721,10 @@
     "textSizeXLarge": "Extra Large",
     "language": "Language",
     "help": "Help",
+    "whatsNew": "What's new",
     "website": "Website",
     "about": "About",
-    "version": "Skills Manager 1.40.4",
+    "version": "Skills Manager {{version}}",
     "tagline": "Cross-platform. Minimal, efficient, seamless multi-preset switching.",
     "checkUpdate": "Check for Updates",
     "checking": "Checking…",
@@ -710,7 +750,7 @@
     "panicBanner": "Skills Manager crashed during the last session ({{time}}).",
     "repoWarning_config_unreadable": "The central library config file is unreadable or corrupt, so this session fell back to the default location (~/.skills-manager). If your library looks empty, your data is still at the previously configured path — set “Central Repo Path” back to it.",
     "repoWarning_repo_path_invalid": "The configured central repository path is invalid, so this session fell back to the default location (~/.skills-manager). If your library looks empty, re-set “Central Repo Path” to where your data lives.",
-    "repoWarning_migration_incomplete": "Moving your central library to the new location couldn’t finish, so this session is using your existing library at its current location — nothing was lost. To complete the move, open Settings and point “Central Repo Path” at an empty, writable folder (tap Edit to see the destination you chose), then restart. Your current library stays where it is until the move succeeds — don’t delete it.",
+    "repoWarning_migration_incomplete": "Moving your central library to the new location couldn’t finish, so this session is using your existing library at its current location — nothing was lost. To complete the move, open Settings and point “Central Repo Path” at an empty, writable folder (tap Edit to see the destination you chose), then quit the app completely, including from the tray, and open it again. Your current library stays where it is until the move succeeds — don’t delete it.",
     "panicDismiss": "Dismiss",
     "gitBackup": "Git Sync",
     "gitBackupDesc": "Back up your skill library to a Git repository for version control and multi-machine sync.",
@@ -750,7 +790,7 @@
     "gitSetupTitle": "Set Up Git Backup",
     "gitSetupSubtitle": "Choose how this skill library connects to a backup.",
     "gitSetupCardCloneTitle": "Use existing remote backup",
-    "gitSetupCardCloneDesc": "Clone from the configured remote. Local skills are preserved and non-conflicting items are merged back.",
+    "gitSetupCardCloneDesc": "Clone from the configured remote and copy in skills that exist only on this machine. If a local skill differs from the remote's copy of the same name, you are asked first and can save the local version to a separate folder before continuing.",
     "gitSetupCardCloneBadge": "Recommended: 2nd machine and beyond",
     "gitSetupCardInitTitle": "Back up this machine as new",
     "gitSetupCardInitDesc": "Initialize Git locally and push the current skill library to the configured remote.",
@@ -761,12 +801,19 @@
     "gitRecoverySubtitleUnrelated": "Local repository and remote do not share history; sync cannot proceed. Pick how to fix it.",
     "gitRecoverySubtitleNoUpstream": "No upstream tracking is set up with the remote. Pick how to fix it.",
     "gitRecoverySubtitleDetached": "Currently in detached HEAD state, possibly after restoring a snapshot. Realign to remote or restore a different snapshot first.",
-    "gitRecoverySubtitleConflict": "Local and remote skills were changed in conflicting ways. The merge was rolled back automatically — re-clone from remote to restore a clean copy. Skills that exist only locally are preserved.",
+    "gitRecoverySubtitleConflict": "Local and remote skills were changed in conflicting ways. The merge was rolled back automatically and the skill files on this machine are as they were. When re-cloning, skills whose local version differs from the remote's are listed first, and you decide whether to save the local versions aside and continue.",
     "gitRecoveryCardRecloneTitle": "Use remote backup (recommended)",
-    "gitRecoveryCardRecloneDesc": "Keep a temporary copy of local skills, re-clone from remote, then merge non-conflicting items back. Safest option.",
+    "gitRecoveryCardRecloneDesc": "Re-clone from the remote and copy in skills that exist only on this machine. Same-named skills that differ are listed first, and their local versions can be saved aside before continuing; old local Git history not confirmed to be on the remote is kept aside.",
     "gitRecoveryCardKeepLocalTitle": "Keep local, set up tracking",
     "gitRecoveryCardKeepLocalDesc": "Try to push local content as the new remote head. Only use when remote is empty or local should overwrite remote.",
     "gitRecoveryRecloneSuccess": "Remote backup re-cloned",
+    "gitRecoveryRecloneKeptHistory": "Remote backup re-cloned. The old local Git history could not be confirmed to be fully on the remote (it may hold unpushed commits or tags), so it was kept at: {{path}}",
+    "gitSetAsideTitle": "Some local skills differ from the remote backup",
+    "gitSetAsideMessage": "The local versions of these skills differ from the same-named copies in the remote backup. If you continue, the local versions are saved to a separate folder next to the skills library and the library uses the remote versions; you'll be told where the folder is.",
+    "gitSetAsideConfirm": "Save local versions and continue",
+    "gitLocalCopiesSaved": "The local versions of the differing skills were saved to: {{path}}",
+    "gitSetAsideCancelled": "Cancelled. Nothing was cloned and this machine's skills library is unchanged.",
+    "gitSetAsideListChanged": "The list changed since you confirmed it — nothing was replaced. Please check it again.",
     "gitRecoveryRecloning": "Re-cloning…",
     "gitRecoveryFallbackHint": "\"Keep local\" currently requires terminal action. See docs or contact the developer.",
     "gitNotInitialized": "Not initialized",
@@ -805,6 +852,8 @@
     "gitErrorAuth": "Authentication failed. Check SSH key or access token.",
     "gitErrorNetwork": "Network connection failed. Check your network and remote URL.",
     "gitErrorConflict": "Local and remote changes conflict. Choose how to resolve it.",
+    "gitErrorFilesKeptAside": "The operation did not finish normally. Some files were kept outside the skills library — don't delete them",
+    "gitErrorCloneLocalDiffers": "Stopped: these local skills differ from the same-named copies in the remote backup, and continuing would overwrite them: {{names}}. Nothing on this machine was changed.",
     "gitErrorNotRepo": "Git repository not found. Set up backup first.",
     "gitErrorRejected": "Remote has new updates. Pull and merge them before syncing.",
     "gitErrorUnrelatedHistories": "Local and remote do not share history. Open Fix Sync Setup to resolve.",
@@ -836,6 +885,7 @@
     "loadFailed": "Failed to load {{item}}",
     "dataOutOfDate": "Some data could not be refreshed",
     "documentMissing": "No document file was found",
+    "diffTooLarge": "Too many lines to compare here",
     "presets": "presets",
     "agents": "agent status",
     "skills": "skill list",
@@ -850,7 +900,8 @@
     "search": "Search",
     "goToSettings": "Settings",
     "expandAll": "Show all",
-    "collapse": "Collapse"
+    "collapse": "Collapse",
+    "expand": "Expand"
   },
   "addFromLibrary": {
     "title": "Add from Library",
@@ -861,6 +912,7 @@
     "selectAllSkills": "Select all skills",
     "deselectAllSkills": "Deselect all skills",
     "selectedCount": "{{count}} selected",
+    "hiddenByFilters": "({{count}} hidden by the current filter)",
     "shiftHint": "Shift + click to select a range",
     "clearTargets": "Clear",
     "searchPlaceholder": "Search the library…",
@@ -875,8 +927,8 @@
     "toastFailed": "{{count}} skill(s) failed to add",
     "toastAddedToProject": "Added \"{{skill}}\" to {{project}}",
     "toastRemovedFromProject": "Removed \"{{skill}}\" from {{project}}",
-    "add": "Add",
-    "installedShort": "Added",
+    "removeConfirmTitle": "Remove from workspace",
+    "removeConfirm": "Permanently delete the \"{{skill}}\" folder from {{project}} ({{agent}})? This action cannot be undone.",
     "projectsTitle": "Project Workspaces",
     "projectsSummary": "{{installed}} / {{total}} installed",
     "errors": {
@@ -892,7 +944,9 @@
       "remove": "Click to remove from this agent",
       "conflict": "Rename the skill in your library first",
       "unavailable": "Select a target agent first"
-    }
+    },
+    "addToProject": "Add to project…",
+    "addToAgent": "Add to {{agent}}"
   },
   "preset": {
     "create": "New Preset",
@@ -907,6 +961,13 @@
     "deleted": "Preset deleted",
     "created": "Preset created",
     "switched": "Switched to \"{{name}}\""
+  },
+  "platform": {
+    "fileManager": {
+      "finder": "Finder",
+      "explorer": "File Explorer",
+      "linux": "File Manager"
+    }
   },
   "project": {
     "title": "Project Skills",
@@ -942,7 +1003,6 @@
     "addSelected": "Add Selected ({{count}})",
     "selectAll": "Select All",
     "deselectAll": "Deselect All",
-    "openInFinder": "Open Directory",
     "skillFiles": "Files",
     "importToCenter": "Update Center",
     "importFromCenter": "Add Skill",
@@ -1013,6 +1073,9 @@
     "batchImportFailed": "{{count}} skills failed to add",
     "deleteSkill": "Delete skill",
     "deleteSkillConfirm": "Permanently delete skill \"{{name}}\"? This action cannot be undone.",
+    "removeUnsyncedTitle": "Delete workspace copies",
+    "removeUnsyncedConfirm": "These copies may hold content that is not in the center. Continuing permanently deletes them. This action cannot be undone.",
+    "removeUnsyncedConfirmWithOthers": "These copies may hold content that is not in the center. Continuing permanently deletes them, along with {{count}} other copy(ies) in this preset that match the center. This action cannot be undone.",
     "skillDeleted": "\"{{name}}\" deleted",
     "selectMode": "Select",
     "cancelSelect": "Exit Select",
@@ -1038,7 +1101,8 @@
     "batchEditTags": "Tags ({{count}})",
     "batchTagsUpdated": "Tags updated for {{count}} center skills",
     "batchTagsFailed": "{{count}} center skills failed to update tags",
-    "batchTagScopeNote": "Tags live in the central library, so edits affect every project using these skills. Project-only local skills are left untouched."
+    "batchTagScopeNote": "Tags live in the central library, so edits affect every project using these skills. Project-only local skills are left untouched.",
+    "revealInFileManager": "Open in {{app}}"
   },
   "presetActions": {
     "button": "Apply Preset",
@@ -1048,6 +1112,7 @@
     "action": "Action",
     "addMissing": "Add missing skills",
     "removeMatching": "Remove matching skills",
+    "removePreset": "Remove {{name}} from this workspace",
     "agents": "Agents",
     "selectAgents": "Select at least one agent",
     "noPresets": "No presets available",
@@ -1140,5 +1205,21 @@
       "deletedLocalBatch": "{{count}} local skills deleted",
       "deleteLocalBatchFailed": "{{count}} local skills failed to delete"
     }
+  },
+  "errorBoundary": {
+    "title": "Something went wrong",
+    "description": "The window hit an unexpected error. Reload to continue. If it keeps happening, copy the details below into a GitHub issue.",
+    "copy": "Copy details",
+    "copied": "Copied",
+    "exportLogs": "Export logs",
+    "exportLogsDone": "Logs saved to {{path}}",
+    "exportLogsFailed": "Failed to export logs.",
+    "reload": "Reload"
+  },
+  "whatsNew": {
+    "title": "What's new",
+    "gotIt": "Got it",
+    "fullChangelog": "Full changelog",
+    "close": "Close"
   }
 }

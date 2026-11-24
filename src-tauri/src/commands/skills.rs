@@ -11,15 +11,16 @@ use crate::core::{
     audit_log::AuditDraft,
     central_repo,
     error::AppError,
-    git_fetcher,
+    file_manager, git_fetcher,
     install_cancel::InstallCancelRegistry,
     installer, path_guard,
     repo_lock::RepoLock,
-    scanner,
+    scanner, scenario_service,
     skill_metadata::{self, is_valid_skill_dir},
     skill_store::{SkillRecord, SkillStore, SkillTargetRecord},
     sync_engine, sync_metadata,
     timing::should_log_first_or_slow,
+    well_known,
 };
 
 #[derive(Debug, Serialize)]
@@ -193,6 +194,12 @@ pub struct BatchDeleteSkillsResult {
 }
 
 #[derive(Debug, Serialize)]
+pub struct InstallLocalResult {
+    pub skill_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ManagedSkillDto {
     pub id: String,
     pub name: String,
@@ -245,6 +252,24 @@ pub struct SourceSkillDocumentDto {
     pub revision: String,
 }
 
+/// One file in a skill's central copy, from the same enumeration as the
+/// content hash and the source diff.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct SkillFileDto {
+    pub relative_path: String,
+    pub size: u64,
+    pub executable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillFileContentDto {
+    pub relative_path: String,
+    /// "text" | "binary" | "too_large"
+    pub content_kind: String,
+    /// Present only when `content_kind == "text"`.
+    pub text: Option<String>,
+}
+
 /// Whole-directory diff between the central copy (`original`) and the source
 /// (`updated`), covering the same file scope that drives the update badge so
 /// the diff can never come back empty while the badge says "update available".
@@ -254,6 +279,9 @@ pub struct SkillSourceDiffDto {
     pub source_label: String,
     pub revision: String,
     pub entries: Vec<SkillSourceDiffEntryDto>,
+    /// More files differ than `entries` lists ([`MAX_DIFF_ENTRIES`]); the
+    /// scan stopped there, so the total is unknown.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,7 +289,8 @@ pub struct SkillSourceDiffEntryDto {
     pub relative_path: String,
     /// "added" | "removed" | "modified"
     pub status: String,
-    /// "text" | "binary" | "too_large" | "permission_only"
+    /// "text" | "binary" | "too_large" | "permission_only" | "omitted"
+    /// ("omitted": text past the preview's [`MAX_DIFF_TEXT_BYTES`] budget)
     pub content_kind: String,
     /// Present only when `content_kind == "text"`.
     pub original_text: Option<String>,
@@ -486,6 +515,112 @@ pub async fn get_source_skill_document(
     .await?
 }
 
+fn skill_central_dir(store: &SkillStore, skill_id: &str) -> Result<PathBuf, AppError> {
+    let skill = store
+        .get_skill_by_id(skill_id)
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::not_found("Skill not found"))?;
+    Ok(PathBuf::from(skill.central_path))
+}
+
+fn list_skill_files_in(dir: &Path) -> Vec<SkillFileDto> {
+    crate::core::content_hash::list_content_files(dir)
+        .into_iter()
+        .map(|entry| SkillFileDto {
+            size: std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0),
+            executable: entry.is_executable(),
+            relative_path: entry.relative_path,
+        })
+        .collect()
+}
+
+/// Reads only a file the content enumeration returned, looked up by exact
+/// `relative_path`. The requested string is never joined onto the directory,
+/// so `../`, absolute paths and symlinks out of the skill (the walk does not
+/// follow them) cannot be reached.
+fn read_skill_file_in(dir: &Path, relative_path: &str) -> Result<SkillFileContentDto, AppError> {
+    let entry = crate::core::content_hash::list_content_files(dir)
+        .into_iter()
+        .find(|entry| entry.relative_path == relative_path)
+        .ok_or_else(|| AppError::not_found(format!("File not found in skill: {relative_path}")))?;
+    // Judge the size before reading, so a large model or archive in the skill
+    // is not pulled into memory just to be reported as too large.
+    let too_large = std::fs::metadata(&entry.path)
+        .map(|m| m.len() > MAX_DIFF_FILE_BYTES as u64)
+        .unwrap_or(false);
+    let (kind, text) = if too_large {
+        ("too_large", None)
+    } else {
+        // A read failure (permissions, a file removed since the walk) is an
+        // error, not "binary": classify_diff_bytes treats None as binary for
+        // the diff, where it means a side without the file.
+        let bytes = std::fs::read(&entry.path)
+            .map_err(|e| AppError::io(format!("Failed to read {relative_path}: {e}")))?;
+        classify_diff_bytes(Some(bytes))
+    };
+    Ok(SkillFileContentDto {
+        relative_path: entry.relative_path,
+        content_kind: kind.into(),
+        text,
+    })
+}
+
+#[tauri::command]
+pub async fn list_skill_files(
+    skill_id: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<Vec<SkillFileDto>, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = skill_central_dir(&store, &skill_id)?;
+        Ok(list_skill_files_in(&dir))
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn read_skill_file(
+    skill_id: String,
+    relative_path: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<SkillFileContentDto, AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = skill_central_dir(&store, &skill_id)?;
+        read_skill_file_in(&dir, &relative_path)
+    })
+    .await?
+}
+
+/// Shows the skill's central copy in the file manager. The path comes from
+/// the id, never from the frontend (same reasoning as `reveal_project_folder`).
+#[tauri::command]
+pub async fn reveal_skill_folder(
+    skill_id: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = skill_central_dir(&store, &skill_id)?;
+        if !path.is_dir() {
+            return Err(AppError::invalid_input(format!(
+                "Folder does not exist: {}",
+                path.display()
+            )));
+        }
+        // explorer.exe exits non-zero even when it succeeds, so the platform
+        // branch is judged by `exit_is_failure` rather than checked here.
+        let status = file_manager::reveal_item(&path).map_err(AppError::io)?;
+        if file_manager::exit_is_failure(status.success()) {
+            return Err(AppError::io(format!(
+                "File manager exited with status: {status}"
+            )));
+        }
+        Ok(())
+    })
+    .await?
+}
+
 /// Files larger than this are flagged but not sent to the frontend — the
 /// line diff is O(n²), so previewing a huge file would hang the UI.
 const MAX_DIFF_FILE_BYTES: usize = 256 * 1024;
@@ -504,13 +639,90 @@ fn classify_diff_bytes(bytes: Option<Vec<u8>>) -> (&'static str, Option<String>)
     }
 }
 
+/// The source diff is a preview, so it is bounded however many files differ
+/// (#658: 5,000+ changed files took the window to 13 GB). At most this many
+/// entries are listed; the scan stops at the next difference.
+const MAX_DIFF_ENTRIES: usize = 200;
+
+/// Text sent across all entries, both sides together. Entries past it are
+/// listed without their text (`"omitted"`).
+const MAX_DIFF_TEXT_BYTES: usize = 2 * 1024 * 1024;
+
+/// One side of a file pair: read only when small enough to preview, so a
+/// large model or archive in the skill is never pulled into memory.
+enum DiffSide {
+    Bytes(Vec<u8>),
+    TooLarge(u64),
+    Unreadable,
+}
+
+fn read_diff_side(path: &Path) -> DiffSide {
+    use std::io::Read;
+    let len = match std::fs::metadata(path) {
+        Ok(m) if m.len() > MAX_DIFF_FILE_BYTES as u64 => return DiffSide::TooLarge(m.len()),
+        Ok(m) => m.len(),
+        Err(_) => return DiffSide::Unreadable,
+    };
+    // Read no more than the limit even if the file grew since the stat.
+    let mut bytes = Vec::with_capacity(len as usize);
+    let read = std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_DIFF_FILE_BYTES as u64 + 1).read_to_end(&mut bytes));
+    match read {
+        Ok(_) if bytes.len() > MAX_DIFF_FILE_BYTES => DiffSide::TooLarge(bytes.len() as u64),
+        Ok(_) => DiffSide::Bytes(bytes),
+        Err(_) => DiffSide::Unreadable,
+    }
+}
+
+fn classify_diff_side(side: DiffSide) -> (&'static str, Option<String>) {
+    match side {
+        DiffSide::Bytes(bytes) => classify_diff_bytes(Some(bytes)),
+        DiffSide::TooLarge(_) => ("too_large", None),
+        DiffSide::Unreadable => ("binary", None),
+    }
+}
+
+/// Compare two files too large to preview a block at a time.
+fn same_large_file(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    fn fill(file: &mut std::fs::File, buf: &mut [u8]) -> Option<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        Some(filled)
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let mut ba = vec![0u8; 64 * 1024];
+    let mut bb = vec![0u8; 64 * 1024];
+    loop {
+        match (fill(&mut fa, &mut ba), fill(&mut fb, &mut bb)) {
+            (Some(na), Some(nb)) if na == nb && ba[..na] == bb[..nb] => {
+                if na == 0 {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+struct SourceDiffEntries {
+    entries: Vec<SkillSourceDiffEntryDto>,
+    truncated: bool,
+}
+
 /// Diff the whole content scope of two skill directories. `original_dir` is
 /// the central copy (old), `updated_dir` is the source (new). Uses the same
-/// file enumeration as the hash so it reports exactly what flips the badge.
-fn build_source_diff_entries(
-    original_dir: &Path,
-    updated_dir: &Path,
-) -> Vec<SkillSourceDiffEntryDto> {
+/// file enumeration as the hash so it reports exactly what flips the badge,
+/// within the preview's limits ([`MAX_DIFF_ENTRIES`], [`MAX_DIFF_TEXT_BYTES`]).
+fn build_source_diff_entries(original_dir: &Path, updated_dir: &Path) -> SourceDiffEntries {
     use crate::core::content_hash::{self, ContentEntry};
     use std::collections::BTreeMap;
 
@@ -528,11 +740,13 @@ fn build_source_diff_entries(
     keys.dedup();
 
     let mut entries = Vec::new();
+    let mut text_bytes = 0usize;
+    let mut truncated = false;
     for key in keys {
-        match (original.get(key), updated.get(key)) {
+        let entry = match (original.get(key), updated.get(key)) {
             (None, Some(u)) => {
-                let (kind, text) = classify_diff_bytes(std::fs::read(&u.path).ok());
-                entries.push(SkillSourceDiffEntryDto {
+                let (kind, text) = classify_diff_side(read_diff_side(&u.path));
+                SkillSourceDiffEntryDto {
                     relative_path: key.clone(),
                     status: "added".into(),
                     content_kind: kind.into(),
@@ -540,11 +754,11 @@ fn build_source_diff_entries(
                     updated_text: text,
                     executable_before: false,
                     executable_after: u.is_executable(),
-                });
+                }
             }
             (Some(o), None) => {
-                let (kind, text) = classify_diff_bytes(std::fs::read(&o.path).ok());
-                entries.push(SkillSourceDiffEntryDto {
+                let (kind, text) = classify_diff_side(read_diff_side(&o.path));
+                SkillSourceDiffEntryDto {
                     relative_path: key.clone(),
                     status: "removed".into(),
                     content_kind: kind.into(),
@@ -552,20 +766,26 @@ fn build_source_diff_entries(
                     updated_text: None,
                     executable_before: o.is_executable(),
                     executable_after: false,
-                });
+                }
             }
             (Some(o), Some(u)) => {
-                let o_bytes = std::fs::read(&o.path).ok();
-                let u_bytes = std::fs::read(&u.path).ok();
+                let o_side = read_diff_side(&o.path);
+                let u_side = read_diff_side(&u.path);
                 let exec_before = o.is_executable();
                 let exec_after = u.is_executable();
-                let bytes_equal = o_bytes.is_some() && o_bytes == u_bytes;
+                let bytes_equal = match (&o_side, &u_side) {
+                    (DiffSide::Bytes(a), DiffSide::Bytes(b)) => a == b,
+                    (DiffSide::TooLarge(a), DiffSide::TooLarge(b)) => {
+                        a == b && same_large_file(&o.path, &u.path)
+                    }
+                    _ => false,
+                };
 
                 if bytes_equal {
                     if exec_before == exec_after {
                         continue; // unchanged — must match the hash's verdict
                     }
-                    entries.push(SkillSourceDiffEntryDto {
+                    SkillSourceDiffEntryDto {
                         relative_path: key.clone(),
                         status: "modified".into(),
                         content_kind: "permission_only".into(),
@@ -573,34 +793,52 @@ fn build_source_diff_entries(
                         updated_text: None,
                         executable_before: exec_before,
                         executable_after: exec_after,
-                    });
-                    continue;
-                }
-
-                let (o_kind, o_text) = classify_diff_bytes(o_bytes);
-                let (u_kind, u_text) = classify_diff_bytes(u_bytes);
-                let (kind, original_text, updated_text) = if o_kind == "text" && u_kind == "text" {
-                    ("text", o_text, u_text)
-                } else if o_kind == "too_large" || u_kind == "too_large" {
-                    ("too_large", None, None)
+                    }
                 } else {
-                    ("binary", None, None)
-                };
-                entries.push(SkillSourceDiffEntryDto {
-                    relative_path: key.clone(),
-                    status: "modified".into(),
-                    content_kind: kind.into(),
-                    original_text,
-                    updated_text,
-                    executable_before: exec_before,
-                    executable_after: exec_after,
-                });
+                    let (o_kind, o_text) = classify_diff_side(o_side);
+                    let (u_kind, u_text) = classify_diff_side(u_side);
+                    let (kind, original_text, updated_text) =
+                        if o_kind == "text" && u_kind == "text" {
+                            ("text", o_text, u_text)
+                        } else if o_kind == "too_large" || u_kind == "too_large" {
+                            ("too_large", None, None)
+                        } else {
+                            ("binary", None, None)
+                        };
+                    SkillSourceDiffEntryDto {
+                        relative_path: key.clone(),
+                        status: "modified".into(),
+                        content_kind: kind.into(),
+                        original_text,
+                        updated_text,
+                        executable_before: exec_before,
+                        executable_after: exec_after,
+                    }
+                }
             }
-            (None, None) => {}
+            (None, None) => continue,
+        };
+
+        if entries.len() == MAX_DIFF_ENTRIES {
+            truncated = true;
+            break;
         }
+        let mut entry = entry;
+        if entry.content_kind == "text" {
+            let size = entry.original_text.as_ref().map_or(0, String::len)
+                + entry.updated_text.as_ref().map_or(0, String::len);
+            if text_bytes + size > MAX_DIFF_TEXT_BYTES {
+                entry.content_kind = "omitted".into();
+                entry.original_text = None;
+                entry.updated_text = None;
+            } else {
+                text_bytes += size;
+            }
+        }
+        entries.push(entry);
     }
 
-    entries
+    SourceDiffEntries { entries, truncated }
 }
 
 #[tauri::command]
@@ -627,12 +865,13 @@ pub async fn get_skill_source_diff(
             if !source_dir.exists() {
                 return Err(AppError::not_found("Original source path no longer exists"));
             }
-            let entries = build_source_diff_entries(&central_dir, &source_dir);
+            let diff = build_source_diff_entries(&central_dir, &source_dir);
             return Ok(SkillSourceDiffDto {
                 skill_id,
                 source_label,
                 revision: "workspace".to_string(),
-                entries,
+                entries: diff.entries,
+                truncated: diff.truncated,
             });
         }
 
@@ -668,12 +907,13 @@ pub async fn get_skill_source_diff(
                 git_source.subpath.as_deref(),
                 git_source.locator_skill_id.as_deref(),
             )?;
-            let entries = build_source_diff_entries(&central_dir, &skill_dir);
+            let diff = build_source_diff_entries(&central_dir, &skill_dir);
             Ok(SkillSourceDiffDto {
                 skill_id,
                 source_label,
                 revision: remote_revision,
-                entries,
+                entries: diff.entries,
+                truncated: diff.truncated,
             })
         })();
 
@@ -766,6 +1006,17 @@ pub fn delete_managed_skills_by_ids(
                 failed.push(skill_id.clone());
                 continue;
             };
+
+            // Checked before anything is removed, deployments included.
+            if let Err(error) = library_dir(&skill.central_path) {
+                store.log_audit(
+                    AuditDraft::new("remove")
+                        .skill(skill_id.clone(), skill.name.clone())
+                        .fail(error.to_string()),
+                );
+                failed.push(skill_id.clone());
+                continue;
+            }
 
             let targets = store.get_targets_for_skill(skill_id)?;
             for target in &targets {
@@ -894,7 +1145,7 @@ pub async fn install_local(
     source_path: String,
     name: Option<String>,
     store: State<'_, Arc<SkillStore>>,
-) -> Result<(), AppError> {
+) -> Result<InstallLocalResult, AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let outcome = (|| -> Result<(String, String), AppError> {
@@ -920,9 +1171,85 @@ pub async fn install_local(
             Ok((skill_id, skill_name))
         })();
         log_install_outcome(&store, "local", outcome.as_ref());
-        outcome.map(|_| ())
+        outcome.map(|(skill_id, name)| InstallLocalResult { skill_id, name })
     })
     .await?
+}
+
+/// Install a skill a website publishes itself (skills.sh `/site/<domain>/<skill>`).
+/// It is a snapshot: there is no repository to check for updates against.
+fn install_site_skill(
+    store: &SkillStore,
+    site_url: &str,
+    name: Option<&str>,
+    proxy_url: Option<&str>,
+    emit_progress: &dyn Fn(&str),
+    cancel: &AtomicBool,
+) -> Result<(String, String), AppError> {
+    emit_progress("cloning");
+    let downloaded =
+        well_known::download_site_skill(site_url, proxy_url).map_err(AppError::network)?;
+    let result = (|| -> Result<(String, String), AppError> {
+        emit_progress("installing");
+        let _lock = RepoLock::acquire_foreground("install website skill").map_err(AppError::db)?;
+        // Checked once the lock is held, right before anything is written: the
+        // download is not interruptible and the lock can take a while, and a
+        // cancel during either must still leave the library untouched.
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AppError::cancelled("Installation cancelled by user"));
+        }
+        let (skill_id, result) = install_site_skill_dir(
+            store,
+            site_url,
+            &downloaded.skill_dir,
+            name,
+            &downloaded.resolved_url,
+            downloaded.revision.clone(),
+            None,
+        )?;
+        Ok((skill_id, result.name))
+    })();
+    well_known::cleanup_temp(&downloaded.temp_dir);
+    result
+}
+
+/// Put a downloaded website skill into the library; the caller holds the repo
+/// lock. Every entry point records the canonical skills.sh URL, so reinstalling
+/// from the market, a pasted link or the CLI lands on the same record and
+/// directory instead of adding a `-2` copy.
+pub fn install_site_skill_dir(
+    store: &SkillStore,
+    site_url: &str,
+    skill_dir: &Path,
+    name: Option<&str>,
+    resolved_url: &str,
+    revision: Option<String>,
+    active_scenario_id: Option<&str>,
+) -> Result<(String, installer::InstallResult), AppError> {
+    let site = well_known::parse_site_ref(site_url)
+        .map_err(|error| AppError::invalid_input(error.to_string()))?;
+    let source_ref = site.canonical_url();
+    let base_name = match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(custom) => skill_metadata::sanitize_skill_name(custom)
+            .ok_or_else(|| AppError::invalid_input(format!("Invalid skill name: '{custom}'")))?,
+        None => site.skill_name,
+    };
+    let (install_name, destination) =
+        resolve_install_target(store, "well-known", &source_ref, &base_name)?;
+    let result = installer::install_skill_dir_to_destination(skill_dir, &install_name, &destination)
+        .map_err(AppError::io)?;
+    let metadata = InstallSourceMetadata {
+        source_type: "well-known".to_string(),
+        source_ref: Some(source_ref),
+        source_ref_resolved: Some(resolved_url.to_string()),
+        source_subpath: None,
+        source_branch: None,
+        source_revision: revision.clone(),
+        remote_revision: revision,
+        update_status: "local_only".to_string(),
+    };
+    let skill_id = store_installed_skill_unlocked(store, &result, &metadata, active_scenario_id)?;
+    Ok((skill_id, result))
 }
 
 #[tauri::command]
@@ -953,6 +1280,21 @@ pub async fn install_git(
                 )
                 .ok();
         };
+
+        if well_known::is_site_ref(&repo_url) {
+            let outcome = install_site_skill(
+                &store,
+                &repo_url,
+                name.as_deref(),
+                proxy_url.as_deref(),
+                &emit_progress,
+                &cancel,
+            );
+            log_install_outcome(&store, "well-known", outcome.as_ref());
+            outcome?;
+            emit_progress("done");
+            return Ok(());
+        }
 
         let outcome = (|| -> Result<(String, String), AppError> {
             git_fetcher::validate_git_url(&repo_url).map_err(AppError::git)?;
@@ -1047,6 +1389,24 @@ pub async fn install_from_skillssh(
                 )
                 .ok();
         };
+
+        // skills.sh also lists skills that websites publish themselves; their
+        // source is the site's domain, not a GitHub `owner/repo`.
+        if !source.contains('/') {
+            let site_url = format!("https://skills.sh/site/{source}/{skill_id}");
+            let outcome = install_site_skill(
+                &store,
+                &site_url,
+                None,
+                proxy_url.as_deref(),
+                &emit_progress,
+                &cancel,
+            );
+            log_install_outcome(&store, "well-known", outcome.as_ref());
+            outcome?;
+            emit_progress("done");
+            return Ok(());
+        }
 
         let outcome = (|| -> Result<(String, String), AppError> {
             emit_progress("cloning");
@@ -1143,6 +1503,59 @@ pub async fn preview_git_install(
 
     tauri::async_runtime::spawn_blocking(move || {
         use tauri::Emitter;
+        if well_known::is_site_ref(&repo_url) {
+            app_handle
+                .emit(
+                    "install-progress",
+                    serde_json::json!({
+                        "skill_id": repo_url,
+                        "phase": "cloning",
+                    }),
+                )
+                .ok();
+            let downloaded = well_known::download_site_skill(&repo_url, proxy_url.as_deref())
+                .map_err(AppError::network)?;
+            let result = (|| -> Result<GitPreviewResult, AppError> {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(AppError::cancelled("Installation cancelled by user"));
+                }
+                let dirs = collect_git_skill_dirs(&downloaded.skill_dir);
+                if dirs.is_empty() {
+                    return Err(AppError::not_found("Downloaded source contains no skills"));
+                }
+                let skills = dirs
+                    .iter()
+                    .map(|dir| {
+                        let meta = skill_metadata::parse_skill_md(dir);
+                        let rel_path = skill_rel_key(&downloaded.skill_dir, dir);
+                        let basename = dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| rel_path.clone());
+                        let name = meta
+                            .name
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or(basename);
+                        GitSkillPreview {
+                            rel_path,
+                            name,
+                            description: meta.description,
+                            // Website skills are snapshots recorded under a well-known source ref, not a git clone URL, so the git-preview installed match never applies — reinstalling is their update path.
+                            installed: false,
+                            installed_skill_id: None,
+                        }
+                    })
+                    .collect();
+                Ok(GitPreviewResult {
+                    temp_dir: downloaded.temp_dir.to_string_lossy().to_string(),
+                    skills,
+                })
+            })();
+            if result.is_err() {
+                well_known::cleanup_temp(&downloaded.temp_dir);
+            }
+            return result;
+        }
         app_handle
             .emit(
                 "install-progress",
@@ -1271,6 +1684,38 @@ pub async fn confirm_git_install(
     let store = store.inner().clone();
     let proxy_url = store.proxy_url();
     tauri::async_runtime::spawn_blocking(move || {
+        if well_known::is_site_ref(&repo_url) {
+            let temp_path = validate_clone_temp_path(&temp_dir)?;
+            let result: Result<(), AppError> = (|| {
+                if items.is_empty() {
+                    return Ok(());
+                }
+                let skill_dir = well_known::skill_dir_from_temp(&temp_path)
+                    .map_err(|error| AppError::invalid_input(error.to_string()))?;
+                let all_dirs = collect_git_skill_dirs(&skill_dir);
+                let _lock = RepoLock::acquire_foreground("confirm website skill install")
+                    .map_err(AppError::db)?;
+                for dir in &all_dirs {
+                    let rel_key = skill_rel_key(&skill_dir, dir);
+                    let item = match items.iter().find(|item| item.rel_path == rel_key) {
+                        Some(item) => item,
+                        None => continue,
+                    };
+                    install_site_skill_dir(
+                        &store,
+                        &repo_url,
+                        dir,
+                        Some(item.name.as_str()),
+                        &repo_url,
+                        None,
+                        None,
+                    )?;
+                }
+                Ok(())
+            })();
+            well_known::cleanup_temp(&temp_path);
+            return result;
+        }
         let temp_path = validate_clone_temp_path(&temp_dir)?;
 
         let result: Result<(), AppError> = (|| {
@@ -1372,8 +1817,9 @@ pub async fn check_all_skill_updates(
         // off the central-repo lock so a slow remote (e.g. vercel/ai's ref
         // advertisement runs ~30s) never starves a concurrent check into a 20s
         // lock-timeout "busy" failure — the reason "检查全部" both crawled and
-        // popped failures.
-        let mut remotes: HashSet<RemoteKey> = HashSet::new();
+        // popped failures. Each remote also carries its subpath skills' installed
+        // directories, so the monorepo siblings share one subtree fetch (#561).
+        let mut remotes: HashMap<RemoteKey, HashSet<(String, String)>> = HashMap::new();
         for skill in &skills {
             if !matches!(skill.source_type.as_str(), "git" | "skillssh") {
                 continue;
@@ -1391,13 +1837,17 @@ pub async fn check_all_skill_updates(
                 ),
             }
             if let Ok(source) = git_source_from_skill(skill) {
-                remotes.insert(RemoteKey::from(source));
+                let installed = installed_subtree(skill, &source);
+                remotes
+                    .entry(RemoteKey::from(source))
+                    .or_default()
+                    .extend(installed);
             }
         }
         let remote_revisions = if remotes.is_empty() {
             HashMap::new()
         } else {
-            resolve_remotes_concurrent(remotes.into_iter().collect(), proxy_url.clone())
+            resolve_remotes_concurrent(remotes, proxy_url.clone())
         };
 
         // ── Phase B: apply the resolved revisions + local-source checks ──
@@ -1414,13 +1864,9 @@ pub async fn check_all_skill_updates(
         let mut failed = Vec::new();
         for skill in &skills {
             let prefetched = if matches!(skill.source_type.as_str(), "git" | "skillssh") {
-                git_source_from_skill(skill).ok().and_then(|source| {
-                    let key = RemoteKey::from(source);
-                    remote_revisions
-                        .get(&key)
-                        .cloned()
-                        .map(|result| PrefetchedRemote { key, result })
-                })
+                git_source_from_skill(skill)
+                    .ok()
+                    .and_then(|source| remote_revisions.get(&RemoteKey::from(source)).cloned())
             } else {
                 None
             };
@@ -1490,6 +1936,48 @@ impl RemoteKey {
 pub struct PrefetchedRemote {
     key: RemoteKey,
     result: Result<String, String>,
+    /// The `(source_revision, subpath)` pairs whose directory is the same tree
+    /// at the resolved revision — see [`git_fetcher::unchanged_subtrees`].
+    unchanged: HashSet<(String, String)>,
+    /// Why those directories could not be compared. A resolved head alone
+    /// does not establish whether an installed subtree changed.
+    comparison_error: Option<String>,
+}
+
+/// The directory a subpath skill was installed from, as `(revision, subpath)`.
+/// `None` for a skill installed from the repository root, which keeps comparing
+/// the whole repository's head.
+fn installed_subtree(skill: &SkillRecord, source: &GitSkillSource) -> Option<(String, String)> {
+    let subpath = source.subpath.as_deref().filter(|s| !s.is_empty())?;
+    Some((skill.source_revision.clone()?, subpath.to_string()))
+}
+
+/// Resolve `key`'s head, then which of `installed` it leaves unchanged.
+fn resolve_remote(
+    key: RemoteKey,
+    installed: &HashSet<(String, String)>,
+    proxy_url: Option<&str>,
+) -> PrefetchedRemote {
+    let resolve = || {
+        git_fetcher::resolve_remote_revision(&key.clone_url, key.branch.as_deref(), proxy_url)
+            .map_err(|err| err.to_string())
+    };
+    let result = resolve();
+    let (unchanged, comparison_error) = match &result {
+        Ok(head) => {
+            match git_fetcher::unchanged_subtrees(&key.clone_url, head, installed, proxy_url) {
+                Ok(unchanged) => (unchanged, None),
+                Err(err) => (HashSet::new(), Some(err.to_string())),
+            }
+        }
+        Err(_) => (HashSet::new(), None),
+    };
+    PrefetchedRemote {
+        key,
+        result,
+        unchanged,
+        comparison_error,
+    }
 }
 
 /// Resolve one skill's remote revision *before* the caller takes the
@@ -1513,11 +2001,13 @@ pub fn prefetch_skill_remote(
     if should_skip_update_check(store, &skill, force).unwrap_or(false) {
         return None;
     }
-    let key = RemoteKey::from(git_source_from_skill(&skill).ok()?);
-    let result =
-        git_fetcher::resolve_remote_revision(&key.clone_url, key.branch.as_deref(), proxy_url)
-            .map_err(|err| err.to_string());
-    Some(PrefetchedRemote { key, result })
+    let source = git_source_from_skill(&skill).ok()?;
+    let installed = installed_subtree(&skill, &source).into_iter().collect();
+    Some(resolve_remote(
+        RemoteKey::from(source),
+        &installed,
+        proxy_url,
+    ))
 }
 
 /// Upper bound on concurrent `ls-remote` queries during a batch check. Collapses
@@ -1530,16 +2020,11 @@ const MAX_CHECK_CONCURRENCY: usize = 8;
 /// `Err(message)` so Phase B can mark just that remote's skills as errored
 /// without aborting the batch.
 fn resolve_remotes_concurrent(
-    remotes: Vec<RemoteKey>,
+    remotes: HashMap<RemoteKey, HashSet<(String, String)>>,
     proxy_url: Option<String>,
-) -> HashMap<RemoteKey, Result<String, String>> {
-    resolve_concurrent(remotes, |key| {
-        git_fetcher::resolve_remote_revision(
-            &key.clone_url,
-            key.branch.as_deref(),
-            proxy_url.as_deref(),
-        )
-        .map_err(|err| err.to_string())
+) -> HashMap<RemoteKey, PrefetchedRemote> {
+    resolve_concurrent(remotes.keys().cloned().collect(), |key| {
+        resolve_remote(key.clone(), &remotes[key], proxy_url.as_deref())
     })
 }
 
@@ -1550,18 +2035,15 @@ fn resolve_remotes_concurrent(
 /// exactly once, a per-remote failure is stored as `Err` rather than aborting the
 /// batch, and — since this function never touches `RepoLock` — resolution always
 /// runs off the central-repo lock.
-fn resolve_concurrent<F>(
-    remotes: Vec<RemoteKey>,
-    resolve: F,
-) -> HashMap<RemoteKey, Result<String, String>>
+fn resolve_concurrent<T, F>(remotes: Vec<RemoteKey>, resolve: F) -> HashMap<RemoteKey, T>
 where
-    F: Fn(&RemoteKey) -> Result<String, String> + Sync,
+    T: Send,
+    F: Fn(&RemoteKey) -> T + Sync,
 {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let next = AtomicUsize::new(0);
-    let results: Mutex<HashMap<RemoteKey, Result<String, String>>> =
-        Mutex::new(HashMap::with_capacity(remotes.len()));
+    let results: Mutex<HashMap<RemoteKey, T>> = Mutex::new(HashMap::with_capacity(remotes.len()));
     let worker_count = MAX_CHECK_CONCURRENCY.min(remotes.len().max(1));
 
     std::thread::scope(|scope| {
@@ -1742,7 +2224,7 @@ pub async fn relink_local_skill_source(
 
         let result = (|| -> Result<(Vec<PendingRemoval>, Option<String>), AppError> {
             let _lock = RepoLock::acquire_foreground("relink local skill").map_err(AppError::db)?;
-            let staged_path = staged_path_for(&skill.central_path);
+            let staged_path = staged_path_for(&skill.central_path)?;
             let install_result = installer::install_from_local_to_destination(
                 &path,
                 Some(&skill.name),
@@ -2000,7 +2482,7 @@ pub fn update_git_skill_internal(
         // installer's output, not the raw checkout — it drops `.git` and every
         // symlink — so comparing against the checkout would report a path as
         // surviving that the swap then removes.
-        let staged_path = staged_path_for(&skill.central_path);
+        let staged_path = staged_path_for(&skill.central_path)?;
         let install_result = if content_changed {
             Some(
                 installer::install_skill_dir_to_destination(&skill_dir, &skill.name, &staged_path)
@@ -2293,7 +2775,7 @@ pub fn set_git_source_internal(
         // copy exactly the set of files `content_hash` covers, so the rewrite
         // could alter files while still reporting `content_changed: false`.
         let description = if content_changed {
-            let staged_path = staged_path_for(&skill.central_path);
+            let staged_path = staged_path_for(&skill.central_path)?;
             let install_result =
                 installer::install_skill_dir_to_destination(&skill_dir, &skill.name, &staged_path)
                     .inspect_err(|_| {
@@ -2417,7 +2899,7 @@ pub fn reimport_local_skill_internal(
 
     let result = (|| -> Result<(Vec<PendingRemoval>, Option<String>), AppError> {
         let _lock = RepoLock::acquire_foreground("reimport local skill").map_err(AppError::db)?;
-        let staged_path = staged_path_for(&skill.central_path);
+        let staged_path = staged_path_for(&skill.central_path)?;
         let install_result =
             installer::install_from_local_to_destination(&path, Some(&skill.name), &staged_path)
                 .inspect_err(|_| {
@@ -2631,9 +3113,12 @@ pub fn check_skill_update_internal_with_remote(
             // central-repo lock, and a network call under that lock is the
             // 20s "busy" failure the off-lock split exists to remove (#315).
             // The next round picks the skill up.
-            let Some(remote_result) = prefetched
-                .filter(|prefetched| prefetched.key.matches(&git_source))
-                .map(|prefetched| prefetched.result)
+            let Some(PrefetchedRemote {
+                result: remote_result,
+                unchanged,
+                comparison_error,
+                ..
+            }) = prefetched.filter(|prefetched| prefetched.key.matches(&git_source))
             else {
                 log::debug!(
                     "check update: no usable prefetched remote for {}, skipping this round",
@@ -2643,8 +3128,40 @@ pub fn check_skill_update_internal_with_remote(
             };
             match remote_result {
                 Ok(remote_revision) => {
+                    // The repo moved, and the comparison that answers for this
+                    // skill's directory failed (#582). That
+                    // says nothing about the skill, so it is not an update:
+                    // record a failed check, as for a head that could not be
+                    // resolved, and let the next round ask again.
+                    if let Some(message) = comparison_error.filter(|_| {
+                        skill.source_revision.as_deref() != Some(remote_revision.as_str())
+                            && installed_subtree(&skill, &git_source).is_some()
+                    }) {
+                        store
+                            .update_skill_check_state(
+                                &skill.id,
+                                Some(&remote_revision),
+                                "error",
+                                Some(&message),
+                            )
+                            .map_err(AppError::db)?;
+                        return Err(AppError::git(message));
+                    }
                     let update_status = match skill.source_revision.as_deref() {
                         Some(current) if current == remote_revision => "up_to_date",
+                        // The repo moved but this skill's directory did not
+                        // (#561). Record the new head as its source, as an
+                        // update that changed nothing would, so the next
+                        // check compares from there without fetching again.
+                        Some(_)
+                            if installed_subtree(&skill, &git_source)
+                                .is_some_and(|installed| unchanged.contains(&installed)) =>
+                        {
+                            store
+                                .update_skill_source_revision(&skill.id, &remote_revision)
+                                .map_err(AppError::db)?;
+                            "up_to_date"
+                        }
                         Some(_) => "update_available",
                         None => "unknown",
                     };
@@ -2692,6 +3209,9 @@ pub fn check_skill_update_internal_with_remote(
                 .update_skill_check_state(&skill.id, None, status, error.as_deref())
                 .map_err(AppError::db)?;
         }
+        // A website snapshot has no revision to compare against; it stays
+        // `local_only` rather than turning `unknown` on every check.
+        "well-known" => {}
         _ => {
             store
                 .update_skill_check_state(&skill.id, None, "unknown", None)
@@ -2900,7 +3420,9 @@ pub fn validate_clone_temp_path(temp_dir: &str) -> Result<PathBuf, AppError> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if dir_name_str.starts_with(git_fetcher::CLONE_TEMP_PREFIX) {
+        if dir_name_str.starts_with(git_fetcher::CLONE_TEMP_PREFIX)
+            || dir_name_str.starts_with(well_known::TEMP_DIR_PREFIX)
+        {
             return Ok(temp_path);
         }
     }
@@ -2973,16 +3495,39 @@ pub fn resolve_skillssh_install_target(
     source_ref: &str,
     skill_id: &str,
 ) -> Result<(String, PathBuf), AppError> {
-    if let Some(existing) = store
-        .get_skill_by_source_ref("skillssh", source_ref)
-        .map_err(AppError::db)?
-    {
-        return Ok((existing.name, PathBuf::from(existing.central_path)));
+    resolve_install_target(store, "skillssh", source_ref, skill_id)
+}
+
+/// A reinstall keeps the directory its record already owns; a new skill takes
+/// the first name that is neither another record's (even with identical
+/// content) nor an existing folder, which installing would replace.
+fn resolve_install_target(
+    store: &SkillStore,
+    source_type: &str,
+    source_ref: &str,
+    skill_id: &str,
+) -> Result<(String, PathBuf), AppError> {
+    if skill_id.trim().is_empty() {
+        return Err(AppError::invalid_input("Skill id is empty"));
+    }
+    // Judged as given: trimming first would rewrite `demo ` into `demo`.
+    let base_name = skill_id;
+    // The id comes from a skills.sh listing or a CLI argument and becomes a
+    // directory name under the library: anything but one plain path segment
+    // could land the install elsewhere (#422).
+    if !skill_metadata::is_portable_dir_name(base_name) {
+        return Err(AppError::invalid_input(format!(
+            "Invalid skill id: '{skill_id}'"
+        )));
     }
 
-    let base_name = skill_id.trim();
-    if base_name.is_empty() {
-        return Err(AppError::invalid_input("Skill id is empty"));
+    if let Some(existing) = store
+        .get_skill_by_source_ref(source_type, source_ref)
+        .map_err(AppError::db)?
+    {
+        // The installer replaces this directory wholesale.
+        let central_path = library_dir(&existing.central_path)?;
+        return Ok((existing.name, central_path));
     }
 
     let mut attempt = 1;
@@ -2994,10 +3539,11 @@ pub fn resolve_skillssh_install_target(
         };
         let candidate_path = central_repo::skills_dir().join(&candidate_name);
         let candidate_path_str = candidate_path.to_string_lossy().to_string();
-        let occupied = store
-            .get_skill_by_central_path(&candidate_path_str)
-            .map_err(AppError::db)?
-            .is_some();
+        let occupied = candidate_path.exists()
+            || store
+                .get_skill_by_central_path(&candidate_path_str)
+                .map_err(AppError::db)?
+                .is_some();
 
         if !occupied {
             return Ok((candidate_name, candidate_path));
@@ -3007,13 +3553,42 @@ pub fn resolve_skillssh_install_target(
     }
 }
 
-pub fn staged_path_for(central_path: &str) -> PathBuf {
+/// `path` lies below `root` (not equal to it) by plain components, so no
+/// `..` can walk it back out.
+fn is_strictly_inside(path: &Path, root: &Path) -> bool {
+    use std::path::Component;
+    match path.strip_prefix(root) {
+        Ok(rest) => {
+            rest.components().next().is_some()
+                && rest.components().all(|c| matches!(c, Component::Normal(_)))
+        }
+        Err(_) => false,
+    }
+}
+
+/// The library directory a record names, for an operation about to replace
+/// or delete it. A record that points outside the library (possible before
+/// skill ids were checked, #422) is refused, never followed.
+pub(crate) fn library_dir(central_path: &str) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(central_path);
+    if is_strictly_inside(&path, &central_repo::skills_dir()) {
+        Ok(path)
+    } else {
+        Err(AppError::invalid_input(format!(
+            "This skill is recorded outside the library ({central_path}); Skills Manager will not modify that folder"
+        )))
+    }
+}
+
+/// Where a replacement is built before it is swapped in: next to the
+/// library directory being replaced, which must lie inside the library.
+pub fn staged_path_for(central_path: &str) -> Result<PathBuf, AppError> {
+    let path = library_dir(central_path)?;
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "skill".to_string());
-    path.with_file_name(format!(".{file_name}.staged-{}", uuid::Uuid::new_v4()))
+    Ok(path.with_file_name(format!(".{file_name}.staged-{}", uuid::Uuid::new_v4())))
 }
 
 pub fn swap_skill_directory(staged_path: &Path, current_path: &Path) -> Result<(), AppError> {
@@ -3054,6 +3629,16 @@ pub fn resync_copy_targets(store: &SkillStore, skill_id: &str) -> Result<(), App
 
     for target in targets {
         if target.mode != "copy" {
+            continue;
+        }
+        // An update that changed no content leaves the copies alone.
+        if scenario_service::recorded_target_is_current(
+            Some(&target),
+            &source,
+            Path::new(&target.target_path),
+            sync_engine::SyncMode::Copy,
+            skill.content_hash.as_deref(),
+        ) {
             continue;
         }
 
@@ -3788,7 +4373,7 @@ mod tests {
 
         let out = resolve_concurrent(remotes.clone(), |key| {
             calls.fetch_add(1, Ordering::Relaxed);
-            Ok(format!("rev:{}", key.clone_url))
+            Ok::<_, String>(format!("rev:{}", key.clone_url))
         });
 
         assert_eq!(
@@ -3838,7 +4423,7 @@ mod tests {
             peak.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(20));
             in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok("rev".to_string())
+            Ok::<_, String>("rev".to_string())
         });
 
         assert_eq!(out.len(), 8);
@@ -3867,6 +4452,8 @@ mod tests {
         Some(PrefetchedRemote {
             key: remote(url, None),
             result: Ok(revision.to_string()),
+            unchanged: HashSet::new(),
+            comparison_error: None,
         })
     }
 
@@ -4030,6 +4617,8 @@ mod tests {
             Some(PrefetchedRemote {
                 key: remote("https://example.test/a.git", None),
                 result: Err("could not read from remote".to_string()),
+                unchanged: HashSet::new(),
+                comparison_error: None,
             }),
         )
         .unwrap_err();
@@ -4041,6 +4630,66 @@ mod tests {
             stored.last_check_error.as_deref(),
             Some("could not read from remote")
         );
+    }
+
+    /// A head that resolved, followed by a failed subtree comparison (#582).
+    fn prefetch_comparison_error(url: &str, revision: &str, reason: &str) -> Option<PrefetchedRemote> {
+        Some(PrefetchedRemote {
+            comparison_error: Some(reason.to_string()),
+            ..prefetch(url, revision).unwrap()
+        })
+    }
+
+    /// The repo moved, but whether a subpath skill's directory moved with it
+    /// was never established: the comparison failed. That
+    /// is a failed check, like a head that could not be resolved — not an
+    /// update, which the badge, the notification and auto-update would act on.
+    /// The installed revision stays, so the next round compares again.
+    #[test]
+    fn a_failed_subtree_comparison_records_a_failed_check() {
+        let repo = test_repo();
+        let url = "https://example.test/a.git";
+        insert_monorepo_skill(&repo.store, "a", url, Some("skills/a"), "old-rev");
+        let reason = "fatal: unable to access: SSL_connect: SSL_ERROR_SYSCALL";
+
+        let err = check_skill_update_internal_with_remote(
+            &repo.store,
+            "a",
+            false,
+            prefetch_comparison_error(url, "new-rev", reason),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.message, reason);
+        let stored = repo.store.get_skill_by_id("a").unwrap().unwrap();
+        assert_eq!(stored.update_status, "error");
+        assert_eq!(stored.last_check_error.as_deref(), Some(reason));
+        assert_eq!(stored.source_revision.as_deref(), Some("old-rev"));
+        assert_eq!(stored.remote_revision.as_deref(), Some("new-rev"));
+    }
+
+    /// The comparison only ever answers for a subpath skill whose revision is
+    /// behind the head. A skill installed from the repository root still sees
+    /// the moved head as its update, and a subpath skill already at the head
+    /// is up to date, whatever became of the comparison.
+    #[test]
+    fn a_failed_comparison_leaves_skills_it_does_not_answer_for() {
+        let repo = test_repo();
+        let url = "https://example.test/a.git";
+        insert_monorepo_skill(&repo.store, "root", url, None, "old-rev");
+        insert_monorepo_skill(&repo.store, "current", url, Some("skills/b"), "new-rev");
+        let check = |id: &str| {
+            check_skill_update_internal_with_remote(
+                &repo.store,
+                id,
+                false,
+                prefetch_comparison_error(url, "new-rev", "remote unreachable"),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(check("root").update_status, "update_available");
+        assert_eq!(check("current").update_status, "up_to_date");
     }
 
     /// Callers hold the central-repo lock across this write, so a git skill with
@@ -4058,6 +4707,148 @@ mod tests {
         assert_eq!(dto.update_status, "unknown");
         let stored = repo.store.get_skill_by_id("skill-1").unwrap().unwrap();
         assert_eq!(stored.last_checked_at, None, "no network, no write");
+    }
+
+    // ── Subpath skills of one monorepo (#561) ──
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .output()
+            .expect("git must be runnable");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `file://` wants forward slashes and, on Windows, a slash before the drive.
+    fn file_url(path: &Path) -> String {
+        let raw = path.display().to_string().replace('\\', "/");
+        if raw.starts_with('/') {
+            format!("file://{raw}")
+        } else {
+            format!("file:///{raw}")
+        }
+    }
+
+    /// A repository holding a root skill and two sibling skills, `skills/a` and
+    /// `skills/b`, served over `file://`. Returns its path, URL and first commit.
+    fn monorepo(repo: &TestRepo) -> (PathBuf, String, String) {
+        let dir = repo._tmp.path().join("monorepo");
+        write_skill(&dir, "root");
+        write_skill(&dir.join("skills/a"), "a");
+        write_skill(&dir.join("skills/b"), "b");
+        git_in(&dir, &["init", "-q"]);
+        git_in(&dir, &["add", "-A"]);
+        git_in(&dir, &["commit", "-qm", "init"]);
+        // The blobless fetch is served by this repo, so the switch belongs here.
+        git_in(&dir, &["config", "uploadpack.allowFilter", "true"]);
+        let first = git_in(&dir, &["rev-parse", "HEAD"]);
+        let url = file_url(&dir);
+        (dir, url, first)
+    }
+
+    fn commit_file(dir: &Path, rel: &str, body: &str) -> String {
+        fs::write(dir.join(rel), body).unwrap();
+        git_in(dir, &["add", rel]);
+        git_in(dir, &["commit", "-qm", rel]);
+        git_in(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn insert_monorepo_skill(
+        store: &SkillStore,
+        id: &str,
+        url: &str,
+        subpath: Option<&str>,
+        revision: &str,
+    ) {
+        insert_git_skill(store, id, url);
+        store
+            .update_skill_source_metadata(id, Some(url), subpath, None, Some(revision))
+            .unwrap();
+    }
+
+    /// The reported bug, end to end through the real check: a commit that only
+    /// touches `skills/a` is an update for `a` and nothing else in that repo —
+    /// except a skill installed from the repository root, which still sees
+    /// every commit, exactly as before.
+    #[test]
+    fn a_monorepo_commit_flags_only_the_skill_it_touches() {
+        let repo = test_repo();
+        let (dir, url, first) = monorepo(&repo);
+        insert_monorepo_skill(&repo.store, "a", &url, Some("skills/a"), &first);
+        insert_monorepo_skill(&repo.store, "b", &url, Some("skills/b"), &first);
+        insert_monorepo_skill(&repo.store, "root", &url, None, &first);
+
+        let head = commit_file(&dir, "skills/a/SKILL.md", "---\nname: a\n---\nchanged\n");
+
+        let check = |id: &str| check_skill_update_internal(&repo.store, id, true, None).unwrap();
+        assert_eq!(check("a").update_status, "update_available");
+        assert_eq!(check("b").update_status, "up_to_date");
+        assert_eq!(check("root").update_status, "update_available");
+
+        // `b`'s directory is the same tree at the new head, so that head is now
+        // what it was installed from: the next check needs no fetch.
+        let b = repo.store.get_skill_by_id("b").unwrap().unwrap();
+        assert_eq!(b.source_revision.as_deref(), Some(head.as_str()));
+        assert_eq!(b.remote_revision.as_deref(), Some(head.as_str()));
+        let a = repo.store.get_skill_by_id("a").unwrap().unwrap();
+        assert_eq!(a.source_revision.as_deref(), Some(first.as_str()));
+
+        // A `.gitattributes` above the directory changes the bytes an update
+        // writes into it — here every line ending — while its tree stays put.
+        commit_file(&dir, ".gitattributes", "skills/b/** text eol=crlf\n");
+        assert_eq!(check("b").update_status, "update_available");
+        let b = repo.store.get_skill_by_id("b").unwrap().unwrap();
+        assert_eq!(b.source_revision.as_deref(), Some(head.as_str()));
+    }
+
+    /// An installed revision the server no longer has cannot be compared.
+    /// A successful head lookup does not establish an update for that subtree.
+    #[test]
+    fn an_unfetchable_installed_revision_records_a_failed_check() {
+        let repo = test_repo();
+        let (dir, url, _) = monorepo(&repo);
+        let gone = "0123456789abcdef0123456789abcdef01234567";
+        insert_monorepo_skill(&repo.store, "b", &url, Some("skills/b"), gone);
+        commit_file(&dir, "skills/a/SKILL.md", "---\nname: a\n---\nchanged\n");
+
+        let err = check_skill_update_internal(&repo.store, "b", true, None).unwrap_err();
+
+        let b = repo.store.get_skill_by_id("b").unwrap().unwrap();
+        assert_eq!(b.update_status, "error");
+        assert_eq!(b.last_check_error.as_deref(), Some(err.message.as_str()));
+        assert_eq!(b.source_revision.as_deref(), Some(gone));
+    }
+
+    /// "Check all" resolves each remote once. Its siblings — here installed at
+    /// different revisions — are answered from that one resolution.
+    #[test]
+    fn one_resolution_answers_every_sibling_of_a_remote() {
+        let repo = test_repo();
+        let (dir, url, first) = monorepo(&repo);
+        let second = commit_file(&dir, "SKILL.md", "---\nname: root\n---\nroot only\n");
+        commit_file(&dir, "skills/a/SKILL.md", "---\nname: a\n---\nchanged\n");
+
+        let key = remote(&url, None);
+        let installed: HashSet<(String, String)> = [
+            (first.clone(), "skills/a".to_string()),
+            (second.clone(), "skills/b".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let out = resolve_remotes_concurrent(HashMap::from([(key.clone(), installed)]), None);
+
+        assert_eq!(
+            out[&key].unchanged,
+            HashSet::from([(second, "skills/b".to_string())])
+        );
     }
 
     fn write_skill(dir: &Path, name: &str) {
@@ -4495,5 +5286,402 @@ mod tests {
         let stored = crate::core::custom_repos::list(&store).unwrap();
         assert!(stored[0].last_fetch_at.unwrap() > 0);
         assert_eq!(stored[0].last_fetch_count, Some(7));
+    }
+
+    fn site_skill_source(body: &str) -> TempDir {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("SKILL.md"), body).unwrap();
+        dir
+    }
+
+    /// Reinstalling a website skill, however its URL is spelled, updates the
+    /// record and directory it already has. A same-named skill from another
+    /// site gets its own, even with identical content.
+    #[test]
+    fn a_site_skill_reinstall_keeps_its_record_and_another_site_gets_its_own() {
+        let repo = test_repo();
+        let feishu = "https://skills.sh/site/open.feishu.cn/lark-im";
+        let v1 = site_skill_source("---\nname: lark-im\n---\nv1\n");
+        let (id, installed) =
+            install_site_skill_dir(&repo.store, feishu, v1.path(), None, "r", None, None).unwrap();
+
+        let v2 = site_skill_source("---\nname: lark-im\n---\nv2\n");
+        let respelled = "https://www.skills.sh/site/open.feishu.cn/lark-im";
+        let (again, _) =
+            install_site_skill_dir(&repo.store, respelled, v2.path(), None, "r", None, None).unwrap();
+        assert_eq!(again, id);
+        assert!(fs::read_to_string(installed.central_path.join("SKILL.md")).unwrap().ends_with("v2\n"));
+        assert!(!central_repo::skills_dir().join("lark-im-2").exists());
+
+        let larksuite = "https://skills.sh/site/open.larksuite.com/lark-im";
+        let (other, other_result) =
+            install_site_skill_dir(&repo.store, larksuite, v2.path(), None, "r", None, None).unwrap();
+        assert_ne!(other, id);
+        assert_eq!(other_result.name, "lark-im-2");
+        let original = repo.store.get_skill_by_id(&id).unwrap().unwrap();
+        assert_eq!(original.source_ref.as_deref(), Some(feishu));
+    }
+
+    /// A skills.sh id becomes a directory name in the library, so only one
+    /// plain path segment is accepted (#422), checked before any record is
+    /// looked up; ordinary names still install under their own name.
+    #[test]
+    fn a_skillssh_id_must_be_one_path_segment() {
+        let repo = test_repo();
+        for bad in [
+            "../escape", "../../escape", "a/b", "a\\b", "..", ".", "/abs", "  ../x  ",
+            "C:x", "a:b", "a\u{1}b", "a|b", "a*b", "CON", "nul.txt", "trailing.",
+            "demo ", " demo", "demo\n", "\tdemo", "COM¹", "lpt³.txt",
+        ] {
+            let result = resolve_skillssh_install_target(&repo.store, &format!("o/r/{bad}"), bad);
+            assert!(result.is_err(), "{bad:?} must be rejected, got {result:?}");
+        }
+        // A record for the same source does not let a bad id through.
+        let inside = write_skill_dir("evil");
+        let mut record = sample_skill("s-evil", "evil", &inside);
+        record.source_type = "skillssh".to_string();
+        record.source_ref = Some("o/r/../evil".to_string());
+        repo.store.insert_skill(&record).unwrap();
+        assert!(resolve_skillssh_install_target(&repo.store, "o/r/../evil", "../evil").is_err());
+
+        for good in ["frontend-design", "my_skill", "v1.2", "技能", "a b", "x@y", "(beta)"] {
+            let (name, path) =
+                resolve_skillssh_install_target(&repo.store, &format!("o/r/{good}"), good).unwrap();
+            assert_eq!(name, good);
+            assert_eq!(path, central_repo::skills_dir().join(good));
+        }
+    }
+
+    /// A record written before ids were checked can point outside the library;
+    /// reinstalling it would replace that directory wholesale, so it is refused
+    /// and the directory is left alone (#422).
+    #[test]
+    fn a_reinstall_recorded_outside_the_library_is_refused() {
+        let repo = test_repo();
+        // The shape an unchecked id left behind: lexically under the library.
+        let outside = central_repo::skills_dir().join("../outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "mine").unwrap();
+        let mut record = sample_skill("s-out", "escape", &outside);
+        record.source_type = "skillssh".to_string();
+        record.source_ref = Some("o/r/escape".to_string());
+        repo.store.insert_skill(&record).unwrap();
+
+        let result = resolve_skillssh_install_target(&repo.store, "o/r/escape", "escape");
+        assert!(result.is_err(), "got {result:?}");
+        assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "mine");
+
+        let inside = write_skill_dir("fine");
+        let mut ok = sample_skill("s-in", "fine", &inside);
+        ok.source_type = "skillssh".to_string();
+        ok.source_ref = Some("o/r/fine".to_string());
+        repo.store.insert_skill(&ok).unwrap();
+        let (name, path) = resolve_skillssh_install_target(&repo.store, "o/r/fine", "fine").unwrap();
+        assert_eq!((name.as_str(), path), ("fine", inside));
+    }
+
+    /// Every replace-in-place (update, set-source, relink, reimport) stages
+    /// next to the directory it replaces through `staged_path_for`, which
+    /// refuses a directory outside the library (#422).
+    #[test]
+    fn staging_is_refused_outside_the_library() {
+        let repo = test_repo();
+        let outside = repo._tmp.path().join("outside");
+        assert!(staged_path_for(&outside.to_string_lossy()).is_err());
+        let lib = central_repo::skills_dir();
+        assert!(staged_path_for(&lib.join("../outside").to_string_lossy()).is_err());
+        assert!(staged_path_for(&lib.to_string_lossy()).is_err());
+        let staged = staged_path_for(&lib.join("cat/fine").to_string_lossy()).unwrap();
+        assert_eq!(staged.parent(), Some(lib.join("cat").as_path()));
+    }
+
+    /// A local reimport of a record that points outside the library fails
+    /// without creating anything next to, or touching, that directory.
+    #[test]
+    fn a_reimport_recorded_outside_the_library_leaves_it_alone() {
+        let repo = test_repo();
+        let outside = central_repo::skills_dir().join("../outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), "---\nname: escape\n---\nmine\n").unwrap();
+        let source = repo._tmp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "---\nname: escape\n---\nnew\n").unwrap();
+        let mut record = sample_skill("s-out", "escape", &outside);
+        record.source_type = "local".to_string();
+        record.source_ref = Some(source.to_string_lossy().to_string());
+        repo.store.insert_skill(&record).unwrap();
+
+        assert!(reimport_local_skill_internal(&repo.store, "s-out", None).is_err());
+        assert!(fs::read_to_string(outside.join("SKILL.md")).unwrap().ends_with("mine\n"));
+        let parent = central_repo::skills_dir().parent().unwrap().to_path_buf();
+        let siblings: Vec<_> = fs::read_dir(parent).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(
+            siblings.iter().all(|n| !n.to_string_lossy().contains("staged")),
+            "staging created next to the outside directory: {siblings:?}"
+        );
+    }
+
+    /// Deleting a record that points outside the library fails and removes
+    /// nothing: not the directory, not its deployments, not the record.
+    #[test]
+    fn deleting_a_skill_recorded_outside_the_library_removes_nothing() {
+        let repo = test_repo();
+        let outside = central_repo::skills_dir().join("../outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "mine").unwrap();
+        repo.store.insert_skill(&sample_skill("s-out", "escape", &outside)).unwrap();
+        let deployed = repo._tmp.path().join("agent/escape");
+        fs::create_dir_all(&deployed).unwrap();
+        fs::write(deployed.join("SKILL.md"), "copy").unwrap();
+        repo.store
+            .insert_target(&SkillTargetRecord {
+                id: "t-out".to_string(),
+                skill_id: "s-out".to_string(),
+                tool: "cursor".to_string(),
+                target_path: deployed.to_string_lossy().to_string(),
+                mode: "copy".to_string(),
+                status: "ok".to_string(),
+                synced_at: Some(1),
+                last_error: None,
+                source_hash: None,
+            })
+            .unwrap();
+
+        let result = delete_managed_skills_by_ids(&repo.store, &["s-out".to_string()]).unwrap();
+        assert_eq!(result.deleted, 0);
+        assert_eq!(result.failed, vec!["s-out".to_string()]);
+        assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "mine");
+        assert!(deployed.join("SKILL.md").exists(), "its deployment is left alone too");
+        assert!(repo.store.get_skill_by_id("s-out").unwrap().is_some());
+    }
+
+    /// A folder already in the library that no record owns is not ours to
+    /// replace: a new website skill with the same name goes next to it.
+    #[test]
+    fn a_new_site_skill_never_replaces_an_unrecorded_folder() {
+        let repo = test_repo();
+        let stray = central_repo::skills_dir().join("lark-doc");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("notes.md"), "mine").unwrap();
+
+        let source = site_skill_source("---\nname: lark-doc\n---\n");
+        let (_, installed) = install_site_skill_dir(
+            &repo.store,
+            "https://skills.sh/site/open.feishu.cn/lark-doc",
+            source.path(),
+            None,
+            "r",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(installed.name, "lark-doc-2");
+        assert_eq!(fs::read_to_string(stray.join("notes.md")).unwrap(), "mine");
+    }
+
+    fn diff_dirs() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = tempdir().unwrap();
+        let (old, new) = (tmp.path().join("old"), tmp.path().join("new"));
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("SKILL.md"), "# Demo\n").unwrap();
+        fs::write(new.join("SKILL.md"), "# Demo\n").unwrap();
+        (tmp, old, new)
+    }
+
+    /// #658: thousands of changed files list only the first
+    /// MAX_DIFF_ENTRIES and say there are more.
+    #[test]
+    fn source_diff_lists_at_most_max_entries_and_flags_the_rest() {
+        let (_tmp, old, new) = diff_dirs();
+        for i in 0..MAX_DIFF_ENTRIES + 50 {
+            fs::write(new.join(format!("f{i:04}.txt")), "x\n").unwrap();
+        }
+        let diff = build_source_diff_entries(&old, &new);
+        assert_eq!(diff.entries.len(), MAX_DIFF_ENTRIES);
+        assert!(diff.truncated);
+        assert_eq!(diff.entries[0].relative_path, "f0000.txt");
+
+        let (_tmp, old, new) = diff_dirs();
+        for i in 0..3 {
+            fs::write(new.join(format!("f{i}.txt")), "x\n").unwrap();
+        }
+        let diff = build_source_diff_entries(&old, &new);
+        assert_eq!(diff.entries.len(), 3);
+        assert!(!diff.truncated);
+    }
+
+    /// Text across entries stays within MAX_DIFF_TEXT_BYTES; the files past it
+    /// are still listed, without their text.
+    #[test]
+    fn source_diff_text_stays_within_the_budget() {
+        let (_tmp, old, new) = diff_dirs();
+        let body = "line\n".repeat(MAX_DIFF_FILE_BYTES / 5 - 1);
+        let files = MAX_DIFF_TEXT_BYTES / body.len() + 5;
+        for i in 0..files {
+            fs::write(new.join(format!("f{i:02}.md")), &body).unwrap();
+        }
+        let diff = build_source_diff_entries(&old, &new);
+        assert_eq!(diff.entries.len(), files);
+        let sent: usize = diff
+            .entries
+            .iter()
+            .map(|e| e.updated_text.as_ref().map_or(0, String::len))
+            .sum();
+        assert!(sent <= MAX_DIFF_TEXT_BYTES, "sent {sent} bytes");
+        assert_eq!(diff.entries[0].content_kind, "text");
+        let omitted = diff.entries.iter().filter(|e| e.content_kind == "omitted").count();
+        assert!(omitted >= 5, "only {omitted} omitted");
+        assert!(diff.entries.iter().filter(|e| e.content_kind == "omitted").all(|e| e.updated_text.is_none()));
+    }
+
+    /// Files too large to preview are compared by content without being read
+    /// whole: an identical pair is unchanged, a same-sized different pair is
+    /// reported as too large.
+    #[test]
+    fn source_diff_compares_large_files_by_content() {
+        let (_tmp, old, new) = diff_dirs();
+        let big = "a".repeat(MAX_DIFF_FILE_BYTES + 100_000);
+        fs::write(old.join("same.bin"), &big).unwrap();
+        fs::write(new.join("same.bin"), &big).unwrap();
+        let mut changed = big.clone();
+        changed.replace_range(MAX_DIFF_FILE_BYTES + 50_000..MAX_DIFF_FILE_BYTES + 50_001, "b");
+        fs::write(old.join("changed.bin"), &big).unwrap();
+        fs::write(new.join("changed.bin"), &changed).unwrap();
+
+        let diff = build_source_diff_entries(&old, &new);
+        let paths: Vec<_> = diff.entries.iter().map(|e| (e.relative_path.as_str(), e.content_kind.as_str())).collect();
+        assert_eq!(paths, [("changed.bin", "too_large")]);
+    }
+
+    fn skill_files_fixture() -> (TempDir, PathBuf) {
+        let tmp = tempdir().unwrap();
+        let skill = tmp.path().join("skill");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(skill.join("SKILL.md"), "# Demo\n").unwrap();
+        fs::write(skill.join("references/notes.md"), "notes").unwrap();
+        fs::write(skill.join("logo.bin"), [0u8, 1, 2, 3]).unwrap();
+        fs::write(skill.join("big.txt"), "a".repeat(MAX_DIFF_FILE_BYTES + 1)).unwrap();
+        // A sibling outside the skill that a traversal would reach.
+        fs::write(tmp.path().join("secret.txt"), "outside").unwrap();
+        (tmp, skill)
+    }
+
+    #[test]
+    fn list_skill_files_returns_content_scope_with_sizes() {
+        let (_tmp, skill) = skill_files_fixture();
+        fs::create_dir_all(skill.join(".git")).unwrap();
+        fs::write(skill.join(".git/HEAD"), "ref").unwrap();
+
+        let files = list_skill_files_in(&skill);
+        let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["SKILL.md", "big.txt", "logo.bin", "references/notes.md"]
+        );
+        let notes = files
+            .iter()
+            .find(|f| f.relative_path == "references/notes.md")
+            .unwrap();
+        assert_eq!(notes.size, 5);
+        assert!(!notes.executable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skill_files_marks_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, skill) = skill_files_fixture();
+        let script = skill.join("run.sh");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let files = list_skill_files_in(&skill);
+        assert!(
+            files
+                .iter()
+                .find(|f| f.relative_path == "run.sh")
+                .unwrap()
+                .executable
+        );
+        assert!(
+            !files
+                .iter()
+                .find(|f| f.relative_path == "SKILL.md")
+                .unwrap()
+                .executable
+        );
+    }
+
+    #[test]
+    fn read_skill_file_classifies_text_binary_and_too_large() {
+        let (_tmp, skill) = skill_files_fixture();
+
+        let text = read_skill_file_in(&skill, "references/notes.md").unwrap();
+        assert_eq!(text.content_kind, "text");
+        assert_eq!(text.text.as_deref(), Some("notes"));
+
+        let binary = read_skill_file_in(&skill, "logo.bin").unwrap();
+        assert_eq!(binary.content_kind, "binary");
+        assert!(binary.text.is_none());
+
+        let big = read_skill_file_in(&skill, "big.txt").unwrap();
+        assert_eq!(big.content_kind, "too_large");
+        assert!(big.text.is_none());
+    }
+
+    /// An unreadable file pins both rules: a large one is judged from its size
+    /// without being read (reading it would fail), and a small one reports the
+    /// read failure instead of passing for binary.
+    #[cfg(unix)]
+    #[test]
+    fn read_skill_file_judges_size_unread_and_reports_read_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, skill) = skill_files_fixture();
+        let small = skill.join("locked.md");
+        fs::write(&small, "locked").unwrap();
+        for name in ["big.txt", "locked.md"] {
+            fs::set_permissions(skill.join(name), fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // Root reads through 0o000, so there is nothing to pin.
+        if fs::read(&small).is_ok() {
+            return;
+        }
+
+        let big = read_skill_file_in(&skill, "big.txt").unwrap();
+        assert_eq!(big.content_kind, "too_large");
+        assert!(read_skill_file_in(&skill, "locked.md").is_err());
+    }
+
+    #[test]
+    fn read_skill_file_only_reads_listed_paths() {
+        let (tmp, skill) = skill_files_fixture();
+        let outside = tmp.path().join("secret.txt");
+        let absolute = outside.to_string_lossy().into_owned();
+        for path in [
+            "../secret.txt",
+            "references/../../secret.txt",
+            absolute.as_str(),
+            "./SKILL.md",
+            "references",
+            "missing.md",
+        ] {
+            assert!(
+                read_skill_file_in(&skill, path).is_err(),
+                "{path} must not be readable"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_skill_file_does_not_follow_symlinks_out_of_the_skill() {
+        let (tmp, skill) = skill_files_fixture();
+        std::os::unix::fs::symlink(tmp.path().join("secret.txt"), skill.join("link.txt")).unwrap();
+
+        assert!(list_skill_files_in(&skill)
+            .iter()
+            .all(|f| f.relative_path != "link.txt"));
+        assert!(read_skill_file_in(&skill, "link.txt").is_err());
     }
 }

@@ -3,7 +3,10 @@ use std::process::Command;
 use std::sync::Arc;
 use tauri::{Manager, State};
 
-use crate::core::{central_repo, error::AppError, log_sanitize, skill_store::SkillStore, skillssh_api};
+use crate::core::{
+    central_repo, error::AppError, file_manager, log_sanitize, scenario_service,
+    skill_store::SkillStore, skillssh_api,
+};
 
 #[derive(serde::Serialize)]
 pub struct AppUpdateInfo {
@@ -46,6 +49,19 @@ pub fn log_startup_event(label: String, elapsed_ms: u64) {
     log::info!("frontend startup: {display} {elapsed_ms} ms");
 }
 
+const SYNC_MODE_KEY: &str = "sync_mode";
+
+/// Whether `set_settings` must read the stored value before overwriting it.
+fn needs_previous_value(key: &str) -> bool {
+    key == SYNC_MODE_KEY
+}
+
+/// Whether saving `new` for `key` changes the sync mode, so existing
+/// deployments must be converted (#654).
+fn sync_mode_switched(key: &str, previous: Option<&str>, new: &str) -> bool {
+    key == SYNC_MODE_KEY && previous != Some(new)
+}
+
 #[tauri::command]
 pub async fn set_settings(
     app: tauri::AppHandle,
@@ -57,9 +73,25 @@ pub async fn set_settings(
     let key_for_store = key.clone();
     let value_for_store = value.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // Read the old value only for sync_mode: proxy_url and
+        // git_backup_remote_url are stored encrypted, and a read that fails to
+        // decrypt them must not stop the user from saving a new value.
+        let previous = if needs_previous_value(&key_for_store) {
+            store.get_setting(&key_for_store).map_err(AppError::db)?
+        } else {
+            None
+        };
         store
             .set_setting(&key_for_store, &value_for_store)
             .map_err(AppError::db)?;
+        // Deployments made in the old mode stay what they are on disk until
+        // something rewrites them, so changing the mode converts them now
+        // (#654). The setting stays saved if a conversion fails: the error
+        // names what is still on the old mode.
+        if sync_mode_switched(&key_for_store, previous.as_deref(), &value_for_store) {
+            let converted = scenario_service::resync_targets_to_sync_mode(&store)?;
+            log::info!("sync_mode set to {value_for_store}: converted {converted} deployment(s)");
+        }
         if key_for_store == "show_tray_icon" {
             let tray_enabled = matches!(
                 value_for_store.trim().to_ascii_lowercase().as_str(),
@@ -124,32 +156,15 @@ pub async fn open_central_repo_folder() -> Result<(), AppError> {
     tauri::async_runtime::spawn_blocking(|| {
         let repo_path = central_repo::base_dir();
 
-        #[cfg(target_os = "macos")]
-        let mut cmd = Command::new("open");
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = Command::new("explorer");
-            use std::os::windows::process::CommandExt;
-            c.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            c
-        };
-        #[cfg(target_os = "linux")]
-        let mut cmd = Command::new("xdg-open");
-
-        let status = cmd
-            .arg(&repo_path)
-            .status()
+        let status = file_manager::open_dir(&repo_path)
             .map_err(|e| AppError::io(format!("Failed to open folder: {e}")))?;
 
-        // Windows explorer.exe returns exit code 1 even on success
-        #[cfg(not(target_os = "windows"))]
-        if !status.success() {
+        if file_manager::exit_is_failure(status.success()) {
             return Err(AppError::io(format!(
                 "File manager exited with status: {status}"
             )));
         }
 
-        let _ = status;
         Ok(())
     })
     .await?
@@ -601,7 +616,7 @@ pub async fn export_logs_zip(
 
         zip.finish().map_err(|e| AppError::io(e.to_string()))?;
 
-        reveal_in_file_manager(&zip_path);
+        let _ = file_manager::reveal_item(&zip_path);
 
         Ok(LogExportResult {
             zip_path: zip_path.to_string_lossy().to_string(),
@@ -611,30 +626,28 @@ pub async fn export_logs_zip(
     .await?
 }
 
-fn reveal_in_file_manager(path: &std::path::Path) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("open").arg("-R").arg(path).status();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("explorer");
-        cmd.creation_flags(0x08000000);
-        let arg = format!("/select,{}", path.display());
-        let _ = cmd.arg(arg).status();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(parent) = path.parent() {
-            let _ = Command::new("xdg-open").arg(parent).status();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_sync_mode_reads_the_previous_value() {
+        assert!(needs_previous_value("sync_mode"));
+        // Encrypted keys must be writable even when the old value cannot be
+        // decrypted, so they are never read first.
+        assert!(!needs_previous_value("proxy_url"));
+        assert!(!needs_previous_value("git_backup_remote_url"));
+        assert!(!needs_previous_value("show_tray_icon"));
+    }
+
+    #[test]
+    fn sync_mode_switch_needs_a_changed_sync_mode() {
+        assert!(sync_mode_switched("sync_mode", Some("symlink"), "copy"));
+        assert!(sync_mode_switched("sync_mode", None, "copy"));
+        assert!(!sync_mode_switched("sync_mode", Some("copy"), "copy"));
+        assert!(!sync_mode_switched("proxy_url", Some("a"), "b"));
+        assert!(!sync_mode_switched("proxy_url", None, "b"));
+    }
 
     #[test]
     fn collapses_repeated_tray_lines_old_format() {
